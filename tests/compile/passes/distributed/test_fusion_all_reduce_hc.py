@@ -211,6 +211,12 @@ def _hc_combine_norm_fusion_pass_on_test_model(
         # normalizes the bf16-rounded combined sum -- so the only expected
         # divergence is the custom all-reduce's accumulation order.
         for name, ref, act in zip(("combined_state", "normed"), unfused, fused):
+            max_abs = (ref.float() - act.float()).abs().max().item()
+            exact = float((ref == act).float().mean().item())
+            print(
+                f"[tp{world_size} m={token_num}] {name}: "
+                f"max|diff|={max_abs:.3e} bit-exact={exact:.1%}"
+            )
             torch.testing.assert_close(
                 ref, act, atol=1e-2, rtol=1e-2, msg=lambda s, n=name: f"{n}: {s}"
             )

@@ -1683,17 +1683,29 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
         # reduction than the kernel performs.
         hf_config = config.model_config.hf_config
         hc_count = getattr(hf_config, "hc_count", 0)
-        hc_combine_norm_fusable = (
-            hc_count > 1
-            and getattr(hf_config, "hc_per_branch_norm", False)
-            and hasattr(ca_comm.aiter_ca, "custom_fused_ar_hc_combine_norm")
-        )
-        if hc_count > 1 and not hc_combine_norm_fusable:
-            logger.warning_once(
-                "AITER AR+HC-combine-norm fusion disabled: needs "
-                "hc_per_branch_norm and an aiter build exposing "
-                "'custom_fused_ar_hc_combine_norm'."
+        hc_combine_norm_fusable = False
+        if hc_count > 1:
+            # Importing the AMD HC ops registers qwen4_exp_hc_combine_norm,
+            # which has to exist before the pattern can be traced. Gated on
+            # hc_count so non-Qwen4Exp models never pull the module in -- it
+            # registers ops that collide with the NVIDIA HC implementation.
+            try:
+                import vllm.models.qwen4_exp.amd.ops.hc  # noqa: F401
+
+                hc_op_registered = True
+            except ImportError:
+                hc_op_registered = False
+            hc_combine_norm_fusable = (
+                hc_op_registered
+                and getattr(hf_config, "hc_per_branch_norm", False)
+                and hasattr(ca_comm.aiter_ca, "custom_fused_ar_hc_combine_norm")
             )
+            if not hc_combine_norm_fusable:
+                logger.warning_once(
+                    "AITER AR+HC-combine-norm fusion disabled: needs the AMD "
+                    "Qwen4Exp HC ops, hc_per_branch_norm, and an aiter build "
+                    "exposing 'custom_fused_ar_hc_combine_norm'."
+                )
 
         for epsilon in [1e-5, 1e-6]:
             if hc_combine_norm_fusable:
