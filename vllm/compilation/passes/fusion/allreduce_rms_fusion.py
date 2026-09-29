@@ -1681,8 +1681,8 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
         # norm, whose group size equals the all-reduce width -- the shared-norm
         # variant normalizes across all streams at once, which is a different
         # reduction than the kernel performs.
-        hf_config = config.model_config.hf_config
-        hc_count = getattr(hf_config, "hc_count", 0)
+        hf_config = getattr(config.model_config, "hf_config", None)
+        hc_count = getattr(hf_config, "hc_count", 0) if hf_config is not None else 0
         hc_combine_norm_fusable = False
         if hc_count > 1:
             # Importing the AMD HC ops registers qwen4_exp_hc_combine_norm,
