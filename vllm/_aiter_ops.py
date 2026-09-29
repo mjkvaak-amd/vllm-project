@@ -1139,6 +1139,63 @@ def _rocm_aiter_fused_allreduce_rmsnorm_fake(
     return torch.empty_like(input_), torch.empty_like(residual)
 
 
+def _rocm_aiter_fused_allreduce_hc_combine_norm_impl(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    injection_logits: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AllReduce fused with Qwen4Exp's HyperConnection combine + per-branch norm.
+
+    Returns ``(combined_state, normed)`` to match the unfused
+    ``qwen4_exp_hc_combine_norm`` op, which is the reverse of the AITER
+    convention.
+    """
+    aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
+    assert aiter_ar is not None, "aiter allreduce must be initialized"
+    ca = aiter_ar.aiter_ca
+
+    result = ca.custom_fused_ar_hc_combine_norm(
+        input_,
+        residual,
+        weight,
+        injection_logits,
+        epsilon,
+        hc_count,
+        gemma_norm=True,
+    )
+    if result is None:
+        # Input is past the custom-allreduce size limit, or custom AR is off.
+        # The fusion pass bounds token count against effective_max_size, so
+        # this is a backstop rather than an expected path.
+        from vllm.distributed import tensor_model_parallel_all_reduce
+        from vllm.models.qwen4_exp.amd.ops.hc import hc_combine_norm
+
+        return hc_combine_norm(
+            residual,
+            tensor_model_parallel_all_reduce(input_),
+            injection_logits,
+            weight,
+            epsilon,
+            hc_count,
+        )
+    normed, combined = result
+    return combined, normed
+
+
+def _rocm_aiter_fused_allreduce_hc_combine_norm_fake(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    injection_logits: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(residual), torch.empty_like(residual)
+
+
 def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl(
     input_: torch.Tensor,
     residual: torch.Tensor,
@@ -2754,6 +2811,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_fused_allreduce_hc_combine_norm",
+                op_func=_rocm_aiter_fused_allreduce_hc_combine_norm_impl,
+                fake_impl=_rocm_aiter_fused_allreduce_hc_combine_norm_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_fused_allreduce_rmsnorm_quant_per_group",
                 op_func=(_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl),
                 fake_impl=(_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_fake),
@@ -2832,6 +2895,10 @@ class rocm_aiter_ops:
     @staticmethod
     def get_fused_allreduce_rmsnorm_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm.default
+
+    @staticmethod
+    def get_fused_allreduce_hc_combine_norm_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_hc_combine_norm.default
 
     @staticmethod
     def get_fused_allreduce_rmsnorm_quant_per_group_op() -> OpOverload:

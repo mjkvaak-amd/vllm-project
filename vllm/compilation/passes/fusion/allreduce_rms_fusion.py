@@ -1267,6 +1267,81 @@ class AiterAllreduceFusedAddRMSNormOutputOnlyPattern(
         return _replacement
 
 
+class AiterAllreduceFusedHCCombineNormPattern(BasePattern, VllmPatternReplacement):
+    """Fuse AllReduce + Qwen4Exp HyperConnection combine + per-branch RMSNorm.
+
+    The combine sits at every block boundary and consumes the block's
+    tensor-parallel reduction, so this is the same AR+add+norm shape the
+    patterns above fuse, with the reduced row broadcast across the hc streams.
+
+    ``hc_count`` is a scalar argument of the matched op, so it is baked into
+    the pattern and the pass registers one instance per model.
+    """
+
+    def __init__(
+        self,
+        epsilon: float,
+        hc_count: int,
+        dtype: torch.dtype,
+        device: str | None,
+    ) -> None:
+        super().__init__(dtype, device)
+        self.epsilon = epsilon
+        self.hc_count = hc_count
+        self.FUSED_AR_HC_OP = rocm_aiter_ops.get_fused_allreduce_hc_combine_norm_op()
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        hidden = 16
+        wide = hidden * self.hc_count
+        # residual, input, injection logits, per-branch norm weight
+        return [
+            self.empty(5, wide),
+            self.empty(5, hidden),
+            self.empty(5, self.hc_count),
+            self.empty(wide),
+        ]
+
+    @property
+    def pattern(self):
+        def _pattern(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            injection_logits: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            allreduce_output = tensor_model_parallel_all_reduce(input)
+            return torch.ops.vllm.qwen4_exp_hc_combine_norm(
+                residual,
+                allreduce_output,
+                injection_logits,
+                weight,
+                self.epsilon,
+                self.hc_count,
+            )
+
+        return _pattern
+
+    @property
+    def replacement(self):
+        def _replacement(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            injection_logits: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            fused = self.FUSED_AR_HC_OP(
+                input_=input,
+                residual=residual,
+                injection_logits=injection_logits,
+                weight=weight.to(input.dtype),
+                epsilon=self.epsilon,
+                hc_count=self.hc_count,
+            )
+            return fused[0], fused[1]
+
+        return _replacement
+
+
 class AiterAllreduceFusedRMSNormGroupQuantFP8Pattern(
     BasePattern, VllmPatternReplacement
 ):
@@ -1602,7 +1677,35 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
                 "FP8 quant fusion."
             )
 
+        # Qwen4Exp's HyperConnection combine-norm. Only for the per-branch
+        # norm, whose group size equals the all-reduce width -- the shared-norm
+        # variant normalizes across all streams at once, which is a different
+        # reduction than the kernel performs.
+        hf_config = config.model_config.hf_config
+        hc_count = getattr(hf_config, "hc_count", 0)
+        hc_combine_norm_fusable = (
+            hc_count > 1
+            and getattr(hf_config, "hc_per_branch_norm", False)
+            and hasattr(ca_comm.aiter_ca, "custom_fused_ar_hc_combine_norm")
+        )
+        if hc_count > 1 and not hc_combine_norm_fusable:
+            logger.warning_once(
+                "AITER AR+HC-combine-norm fusion disabled: needs "
+                "hc_per_branch_norm and an aiter build exposing "
+                "'custom_fused_ar_hc_combine_norm'."
+            )
+
         for epsilon in [1e-5, 1e-6]:
+            if hc_combine_norm_fusable:
+                self.register(
+                    AiterAllreduceFusedHCCombineNormPattern(
+                        epsilon,
+                        hc_count,
+                        self.model_dtype,
+                        self.device,
+                    )
+                )
+
             # Quant-fused variants must register first so the pattern matcher
             # tries them before the AR+RMS-only variants. Otherwise the
             # AR+RMS-only fusion runs first and consumes the all_reduce node,
