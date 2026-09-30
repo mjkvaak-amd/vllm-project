@@ -26,6 +26,9 @@ from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.quantization.quark.quark_moe import (
     QuarkOCP_MX_MoEMethod,
 )
+from vllm.model_executor.layers.quantization.utils.config_utils import (
+    is_shared_expert_quant_fse_compatible,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     mxfp4_quantize,
 )
@@ -100,6 +103,12 @@ _QUARK_MXFP4_CONFIG: dict[str, Any] = {
 }
 
 _QUARK_MXFP4_LAYER_CONFIG: dict[str, Any] = _QUARK_MXFP4_CONFIG["global_quant_config"]
+
+# Checkpoint that already stores its shared experts in MXFP4.
+_QUARK_MXFP4_ALL_LINEARS_CONFIG: dict[str, Any] = {
+    **_QUARK_MXFP4_CONFIG,
+    "exclude": [],
+}
 _QUARK_MXFP4_CONFIG = {
     **_QUARK_MXFP4_CONFIG,
     "global_quant_config": {
@@ -180,6 +189,27 @@ def _write_minimal_moe_config(model_path: Path, architecture: str) -> None:
                 index_kv_lora_rank=32,
             )
     (model_path / "config.json").write_text(json.dumps(config))
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_config", "expected"),
+    [(_QUARK_MXFP4_ALL_LINEARS_CONFIG, True), (_QUARK_MXFP4_CONFIG, False)],
+    ids=["shared-expert-in-checkpoint", "shared-expert-excluded"],
+)
+def test_online_targets_off_shared_expert_defer_to_checkpoint(
+    checkpoint_config: dict[str, Any], expected: bool
+) -> None:
+    """Online targets elsewhere in the model keep the checkpoint's FSE verdict."""
+    quant_config = QuarkConfig(checkpoint_config)
+    quant_config.online_quantization_config = OnlineQuantizationConfig(
+        QuantizationConfigArgs(targets={"*linear_attn.out_proj": "mxfp4"})
+    )
+    compatible, reason = is_shared_expert_quant_fse_compatible(
+        quant_config,
+        expert_prefix="model.layers.0.mlp.experts",
+        shared_expert_prefix="model.layers.0.mlp.shared_expert",
+    )
+    assert compatible is expected, reason
 
 
 def test_online_shared_expert_quantization_fusion_tp() -> None:
