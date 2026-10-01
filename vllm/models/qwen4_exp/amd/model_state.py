@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.models.qwen4_exp.common.ngram_context import prepare_ngram_context
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -50,46 +51,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
-        self.ngram_context_offsets = torch.arange(
-            -self.ngram_context_len,
-            0,
-            dtype=torch.int64,
-            device=self.device,
-        )
         self.ple_query_start_loc = torch.zeros(
             self.max_num_reqs + 1,
             dtype=torch.int32,
             device=self.device,
         )
-
-    def _prepare_ngram_context(
-        self,
-        input_batch: InputBatch,
-        req_states: RequestState,
-    ) -> torch.Tensor:
-        num_reqs = input_batch.num_reqs
-        num_reqs_padded = input_batch.num_reqs_after_padding
-        context = self.ngram_context[:num_reqs_padded]
-        context.fill_(self.ngram_eos_token_id)
-        if num_reqs == 0:
-            return context
-
-        request_indices = input_batch.idx_mapping[:num_reqs].long()
-        context_end = req_states.num_computed_tokens.gpu[request_indices].long()
-        token_indices = context_end.unsqueeze(1) + self.ngram_context_offsets
-        valid_tokens = token_indices >= 0
-        token_indices.clamp_min_(0)
-        context_tokens = req_states.all_token_ids.gpu[
-            request_indices.unsqueeze(1), token_indices
-        ]
-        context[:num_reqs].copy_(
-            torch.where(
-                valid_tokens,
-                context_tokens,
-                context_tokens.new_full((), self.ngram_eos_token_id),
-            )
-        )
-        return context
 
     def prepare_inputs(
         self,
@@ -102,10 +68,20 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
-        query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        ngram_context = self.ngram_context[:num_reqs_padded]
+        prepare_ngram_context(
+            ngram_context,
+            query_start_loc,
+            input_batch.query_start_loc[: num_reqs_padded + 1],
+            input_batch.idx_mapping,
+            req_states.num_computed_tokens.gpu,
+            req_states.all_token_ids.gpu,
+            input_batch.num_reqs,
+            self.ngram_eos_token_id,
+        )
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
         return model_inputs
 
