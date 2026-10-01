@@ -530,6 +530,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.gdn_decode_kernel = "XPU"
 
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
+        self.aiter_fused_gated_norm = (
+            GDN_AITER_TRITON_AVAILABLE
+            and envs.VLLM_ROCM_USE_AITER_GDN_FUSED_NORM
+            and self.norm.activation in ("silu", "sigmoid")
+        )
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -886,8 +891,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out,
                 layer_name=_encode_layer_name(self.prefix),
                 use_aiter=True,
+                fuse_gated_norm=self.aiter_fused_gated_norm,
             )
 
+            if self.aiter_fused_gated_norm:
+                output, _ = self.out_proj(core_attn_out.flatten(-2))
+                return output
             return self._output_projection(core_attn_out, z)
         else:
             return self.forward_cuda(hidden_states)
@@ -1187,6 +1196,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ba: torch.Tensor,
         z_out: torch.Tensor,
         core_attn_out: torch.Tensor,
+        fuse_gated_norm: bool = False,
     ):
         """ROCm AITER fast path: conv1d + recurrent attention from packed
         qkvz/ba layout.
@@ -1201,6 +1211,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             z_out: **output** buffer for z        (num_tokens, num_heads,
                    head_dim); mutated in-place.
             core_attn_out: Pre-allocated output buffer for attention results.
+            fuse_gated_norm: apply ``self.norm(core_attn_out, z)`` in place.
 
         """
         forward_context = get_forward_context()
@@ -1227,6 +1238,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 z_out=z_out,
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
+                fuse_gated_norm=fuse_gated_norm,
             )
 
         core_attn_out.zero_()
@@ -1241,6 +1253,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a=a,
             core_attn_out=core_attn_out,
         )
+        if fuse_gated_norm:
+            num_actual_tokens = attn_metadata.num_actual_tokens
+            self._rms_norm_gated_cuda(
+                core_attn_out[:num_actual_tokens],
+                z_out[:num_actual_tokens],
+                core_attn_out[:num_actual_tokens],
+            )
 
     def _forward_core(
         self,
@@ -1569,6 +1588,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z_out: torch.Tensor,
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
+        fuse_gated_norm: bool = False,
     ):
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
@@ -1610,7 +1630,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         )
 
-        # 2. Recurrent attention
+        # 2. Recurrent attention, optionally with the gated RMSNorm epilogue
+        norm_kwargs = {}
+        if fuse_gated_norm:
+            norm_kwargs = dict(
+                norm_weight=self.norm.weight,
+                norm_eps=self.norm.eps,
+                gate=z_out,
+                gate_activation=self.norm.activation,
+            )
         gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule(
             A_log=self.A_log,
             a=a,
@@ -1627,6 +1655,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state_indices=non_spec_state_indices_tensor,
             use_qk_l2norm_in_kernel=True,
             core_attn_out=core_attn_out.reshape(-1),
+            **norm_kwargs,
         )
 
     def _forward_core_decode_non_spec(
@@ -1899,6 +1928,7 @@ def qwen_gdn_attention_core(
     core_attn_out: torch.Tensor,
     layer_name: LayerNameType,
     use_aiter: bool = False,
+    fuse_gated_norm: bool = False,
 ) -> None:
     """Custom op dispatching to _forward_core or _forward_core_rocm.
 
@@ -1911,7 +1941,8 @@ def qwen_gdn_attention_core(
         qkv_or_qkvz is [q, k, v, z], b_or_ba is [b, a], a_or_z_out is the
         z output buffer (mutated in-place).
 
-    ``core_attn_out`` is always mutated in-place.
+    ``core_attn_out`` is always mutated in-place. With ``fuse_gated_norm``
+    (AITER path only) it holds ``self.norm(core_attn_out, z)``.
     """
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -1922,6 +1953,7 @@ def qwen_gdn_attention_core(
             ba=b_or_ba,
             z_out=a_or_z_out,
             core_attn_out=core_attn_out,
+            fuse_gated_norm=fuse_gated_norm,
         )
     else:
         self._forward_core(

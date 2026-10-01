@@ -249,3 +249,70 @@ def test_rocm_prefill_numerics_and_output_layout(state_dtype, correlated):
     no_buffer_output, no_buffer_state = prefill(**kwargs)
     torch.testing.assert_close(no_buffer_output, output, atol=0, rtol=0)
     torch.testing.assert_close(no_buffer_state, final_state, atol=0, rtol=0)
+
+
+def _make_fused_norm_layer():
+    """Stub layer recording what ``_forward_core_rocm`` hands on with the norm."""
+    layer = _make_layer(gqa_interleaved_layout=False)
+    layer.decode_kwargs = []
+    layer.norm_calls = []
+
+    def decode(**kw):
+        layer.calls.append("aiter")
+        layer.decode_kwargs.append(kw)
+
+    layer._forward_core_decode_aiter = decode
+    layer._rms_norm_gated_cuda = lambda x, gate, out: layer.norm_calls.append(
+        (x.shape[0], gate.data_ptr(), out.data_ptr() == x.data_ptr())
+    )
+    return layer
+
+
+def _run_fused(layer, meta, fuse_gated_norm: bool, num_tokens: int):
+    ctx = types.SimpleNamespace(attn_metadata={PREFIX: meta})
+    z_out = torch.zeros(num_tokens, HV, V)
+    with patch.object(qwen_gdn_linear_attn, "get_forward_context", return_value=ctx):
+        layer._forward_core_rocm(
+            qkvz=torch.zeros(num_tokens, 2 * H * K + 2 * HV * V),
+            ba=torch.zeros(num_tokens, 2 * HV),
+            z_out=z_out,
+            core_attn_out=torch.zeros(num_tokens, HV, V),
+            fuse_gated_norm=fuse_gated_norm,
+        )
+    return z_out
+
+
+@pytest.mark.parametrize("fuse_gated_norm", [True, False])
+def test_fused_norm_decode_goes_to_the_kernel_epilogue(fuse_gated_norm: bool) -> None:
+    """Pure decode: the flag reaches the AITER call; no separate norm runs."""
+    layer = _make_fused_norm_layer()
+    _run_fused(layer, _make_metadata(), fuse_gated_norm, num_tokens=4)
+    assert layer.calls == ["aiter"]
+    assert layer.decode_kwargs[0]["fuse_gated_norm"] is fuse_gated_norm
+    assert layer.norm_calls == []
+
+
+@pytest.mark.parametrize(
+    "meta_kwargs",
+    [
+        {"num_prefills": 1},
+        {"num_decodes": 0, "num_prefills": 2},
+        {"spec_sequence_masks": torch.zeros(1, dtype=torch.bool)},
+    ],
+    ids=["has_prefill", "prefill_only", "spec_decode"],
+)
+@pytest.mark.parametrize("fuse_gated_norm", [True, False])
+def test_fused_norm_generic_path_normalizes_in_the_op(
+    meta_kwargs: dict, fuse_gated_norm: bool
+) -> None:
+    """Other batches: the gated norm runs in place over the real tokens only,
+    gated by ``z_out``, and only when asked for."""
+    layer = _make_fused_norm_layer()
+    meta = _make_metadata(**meta_kwargs)
+    num_tokens = meta.num_actual_tokens + 3  # padded
+    z_out = _run_fused(layer, meta, fuse_gated_norm, num_tokens=num_tokens)
+    assert layer.calls == ["generic"]
+    if fuse_gated_norm:
+        assert layer.norm_calls == [(meta.num_actual_tokens, z_out.data_ptr(), True)]
+    else:
+        assert layer.norm_calls == []
