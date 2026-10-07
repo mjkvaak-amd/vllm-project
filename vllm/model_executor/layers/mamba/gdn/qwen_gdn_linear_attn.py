@@ -19,6 +19,7 @@ from vllm.config import (
 )
 from vllm.distributed import (
     divide,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -619,6 +620,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.speculative_config is not None:
             logger.info_once("GDN spec decode kernel: %s", self.gdn_decode_kernel)
 
+        self.aiter_fused_gated_norm = (
+            GDN_AITER_TRITON_AVAILABLE
+            and envs.VLLM_ROCM_USE_AITER_GDN_FUSED_NORM
+            and self.norm.activation in ("silu", "sigmoid")
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+        )
+        if self.aiter_fused_gated_norm:
+            self.gdn_norm_counter = _gdn_norm_counter(
+                vllm_config.scheduler_config.max_num_batched_tokens
+                * (self.num_v_heads // self.tp_size)
+            )
+        self._gdn_norm_presh_tuned: bool | None = None
+
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -966,6 +981,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 device=projected_states_qkvz.device,
             )
 
+            if self.aiter_fused_gated_norm:
+                return self._forward_hip_fused_norm(
+                    projected_states_qkvz, projected_states_ba, z, core_attn_out
+                )
+
             torch.ops.vllm.qwen_gdn_attention_core(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -978,6 +998,84 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return self._output_projection(core_attn_out, z)
         else:
             return self.forward_cuda(hidden_states)
+
+    def _out_proj_is_aiter_mxfp4(self) -> bool:
+        """Whether out_proj is the AITER ASM-layout MXFP4 GEMM, whose
+        dynamic activation quant the GDN core op can take over."""
+        from vllm.model_executor.kernels.linear.mxfp4.aiter import (
+            AiterMxfp4LinearKernel,
+        )
+
+        kernel = getattr(getattr(self.out_proj, "scheme", None), "ocp_mx_linear", None)
+        return (
+            isinstance(kernel, AiterMxfp4LinearKernel)
+            and kernel.use_asm_gemm
+            and self.out_proj.bias is None
+        )
+
+    def _out_proj_presh_tuned(self) -> bool:
+        """Whether the MXFP4 out_proj has a tuned preshuffled small-M config,
+        i.e. whether below M=32 it consumes unshuffled per-1x32 activation
+        scales. Must match ``rocm_aiter_gdn_normed_mxfp4_gemm``."""
+        if self._gdn_norm_presh_tuned is None:
+            weight = self.out_proj.weight
+            self._gdn_norm_presh_tuned = (
+                rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(
+                    weight.shape[0], weight.shape[1]
+                )
+            )
+            logger.info_once(
+                "GDN gated RMSNorm in the AITER core op, MXFP4 activation "
+                "quant below M=32: %s",
+                self._gdn_norm_presh_tuned,
+            )
+        return self._gdn_norm_presh_tuned
+
+    def _forward_hip_fused_norm(
+        self,
+        qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        z: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = qkvz.size(0)
+        v_dim = core_attn_out.shape[-2] * core_attn_out.shape[-1]
+        x_q = x_s = None
+        if self._out_proj_is_aiter_mxfp4():
+            x_q = torch.empty(
+                (num_tokens, v_dim // 2), dtype=torch.uint8, device=qkvz.device
+            )
+            x_s = torch.empty(
+                (num_tokens, v_dim // 32), dtype=torch.uint8, device=qkvz.device
+            )
+
+        torch.ops.vllm.qwen_gdn_attention_core(
+            qkvz,
+            ba,
+            z,
+            core_attn_out,
+            layer_name=_encode_layer_name(self.prefix),
+            use_aiter=True,
+            fuse_gated_norm=True,
+            x_q=x_q,
+            x_s=x_s,
+        )
+
+        x = core_attn_out.flatten(-2)
+        if x_q is None:
+            output, _ = self.out_proj(x)
+            return output
+        output = torch.ops.vllm.rocm_aiter_gdn_normed_mxfp4_gemm(
+            x,
+            x_q,
+            x_s,
+            self.out_proj.weight,
+            self.out_proj.weight_scale,
+            self.out_proj.scheme.ocp_mx_linear.out_dtype,
+        )
+        if self.out_proj.reduce_results and self.out_proj.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
 
     def forward_cuda(
         self,
@@ -1282,6 +1380,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ba: torch.Tensor,
         z_out: torch.Tensor,
         core_attn_out: torch.Tensor,
+        fuse_gated_norm: bool = False,
+        x_q: torch.Tensor | None = None,
+        x_s: torch.Tensor | None = None,
     ):
         """ROCm AITER fast path: conv1d + recurrent attention from packed
         qkvz/ba layout.
@@ -1296,6 +1397,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             z_out: **output** buffer for z        (num_tokens, num_heads,
                    head_dim); mutated in-place.
             core_attn_out: Pre-allocated output buffer for attention results.
+            fuse_gated_norm: apply ``self.norm(core_attn_out, z)``, written to
+                   ``core_attn_out`` in place unless quantized (see x_q).
+            x_q: (num_tokens, v_dim // 2) uint8. Below M=32 with a tuned
+                   preshuffled out_proj, receives the normed output as
+                   packed MXFP4 instead of ``core_attn_out``.
+            x_s: (num_tokens, v_dim // 32) uint8 unshuffled e8m0 scales for
+                   ``x_q``.
 
         """
         forward_context = get_forward_context()
@@ -1311,6 +1419,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
+        quant = (
+            fuse_gated_norm
+            and x_q is not None
+            and qkvz.shape[0] < 32
+            and self._out_proj_presh_tuned()
+        )
         if (
             attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
@@ -1322,6 +1436,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 z_out=z_out,
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
+                fuse_gated_norm=fuse_gated_norm,
+                x_q=x_q if quant else None,
+                x_s=x_s if quant else None,
             )
 
         core_attn_out.zero_()
@@ -1336,6 +1453,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a=a,
             core_attn_out=core_attn_out,
         )
+        if not fuse_gated_norm:
+            return
+        n = attn_metadata.num_actual_tokens
+        if quant:
+            from aiter.ops.triton.quant import fused_rms_gated_mxfp4_quant
+
+            assert x_q is not None and x_s is not None
+            q, s = fused_rms_gated_mxfp4_quant(
+                core_attn_out[:n].reshape(n, -1),
+                self.norm.weight,
+                z_out[:n].reshape(n, -1),
+                self.norm.eps,
+                norm_before_gate=True,
+                activation=self.norm.activation,
+                group_size=self.head_v_dim,
+            )
+            x_q[:n].copy_(q.view(torch.uint8))
+            x_s[:n].copy_(s.view(torch.uint8))
+        else:
+            self._rms_norm_gated_cuda(core_attn_out[:n], z_out[:n], core_attn_out[:n])
 
     def _forward_core(
         self,
@@ -1665,6 +1802,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z_out: torch.Tensor,
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
+        fuse_gated_norm: bool = False,
+        x_q: torch.Tensor | None = None,
+        x_s: torch.Tensor | None = None,
     ):
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
@@ -1706,7 +1846,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         )
 
-        # 2. Recurrent attention
+        # 2. Recurrent attention, optionally with the gated RMSNorm (+ MXFP4
+        # quant) epilogue
+        norm_kwargs = {}
+        if fuse_gated_norm:
+            norm_kwargs = dict(
+                norm_weight=self.norm.weight,
+                norm_eps=self.norm.eps,
+                gate=z_out,
+                gate_activation=self.norm.activation,
+                norm_counter=self.gdn_norm_counter,
+                out_fp4=x_q,
+                out_scale=x_s,
+            )
         gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule(
             A_log=self.A_log,
             a=a,
@@ -1723,6 +1875,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state_indices=non_spec_state_indices_tensor,
             use_qk_l2norm_in_kernel=True,
             core_attn_out=core_attn_out.reshape(-1),
+            **norm_kwargs,
         )
 
     def _forward_core_decode_non_spec(
@@ -1995,6 +2148,9 @@ def qwen_gdn_attention_core(
     core_attn_out: torch.Tensor,
     layer_name: LayerNameType,
     use_aiter: bool = False,
+    fuse_gated_norm: bool = False,
+    x_q: torch.Tensor | None = None,
+    x_s: torch.Tensor | None = None,
 ) -> None:
     """Custom op dispatching to _forward_core or _forward_core_rocm.
 
@@ -2007,7 +2163,8 @@ def qwen_gdn_attention_core(
         qkv_or_qkvz is [q, k, v, z], b_or_ba is [b, a], a_or_z_out is the
         z output buffer (mutated in-place).
 
-    ``core_attn_out`` is always mutated in-place.
+    ``core_attn_out`` is always mutated in-place. ``fuse_gated_norm``, ``x_q``
+    and ``x_s`` (AITER path only) are described in ``_forward_core_rocm``.
     """
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -2018,6 +2175,9 @@ def qwen_gdn_attention_core(
             ba=b_or_ba,
             z_out=a_or_z_out,
             core_attn_out=core_attn_out,
+            fuse_gated_norm=fuse_gated_norm,
+            x_q=x_q,
+            x_s=x_s,
         )
     else:
         self._forward_core(
@@ -2031,7 +2191,67 @@ def qwen_gdn_attention_core(
 direct_register_custom_op(
     op_name="qwen_gdn_attention_core",
     op_func=qwen_gdn_attention_core,
-    mutates_args=["a_or_z_out", "core_attn_out"],
+    mutates_args=["a_or_z_out", "core_attn_out", "x_q", "x_s"],
+)
+
+
+_GDN_NORM_COUNTERS: dict[torch.device, torch.Tensor] = {}
+
+
+def _gdn_norm_counter(numel: int) -> torch.Tensor:
+    """Zeroed int32 arrival counters for the AITER gated-norm epilogue, one
+    per (token, value head). The kernel leaves them zeroed, so all GDN layers
+    share one buffer."""
+    device = torch.device(
+        current_platform.device_type, torch.accelerator.current_device_index()
+    )
+    counter = _GDN_NORM_COUNTERS.get(device)
+    if counter is None or counter.numel() < numel:
+        counter = torch.zeros(numel, dtype=torch.int32, device=device)
+        _GDN_NORM_COUNTERS[device] = counter
+    return counter
+
+
+def rocm_aiter_gdn_normed_mxfp4_gemm(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """out_proj for ``_forward_hip_fused_norm``: below M=32 with a tuned
+    preshuffled config the GEMM takes the activation that the GDN core op
+    already quantized into ``x_q``/``x_s``, otherwise it quantizes the normed
+    ``x`` itself."""
+    from vllm.model_executor.kernels.linear.mxfp4.aiter import (
+        gemm_with_dynamic_quant,
+    )
+
+    if x.shape[0] < 32 and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(
+        weight.shape[0], weight.shape[1]
+    ):
+        return gemm_with_dynamic_quant(
+            x_q, weight, weight_scale, True, out_dtype, x_scales=x_s
+        )
+    return gemm_with_dynamic_quant(x, weight, weight_scale, True, out_dtype)
+
+
+def rocm_aiter_gdn_normed_mxfp4_gemm_fake(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.empty((x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="rocm_aiter_gdn_normed_mxfp4_gemm",
+    op_func=rocm_aiter_gdn_normed_mxfp4_gemm,
+    fake_impl=rocm_aiter_gdn_normed_mxfp4_gemm_fake,
 )
 
 

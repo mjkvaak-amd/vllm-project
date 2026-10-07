@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TOPK_GATING: bool = True
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
+    VLLM_ROCM_USE_AITER_GDN_FUSED_NORM: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -1401,6 +1402,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Apply the GDN gated RMSNorm (and, for an MXFP4 out_proj, the activation
+    # quant) inside the AITER GDN core op: as an epilogue of the recurrent
+    # kernel for decode batches, as a separate kernel otherwise.
+    "VLLM_ROCM_USE_AITER_GDN_FUSED_NORM": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_GDN_FUSED_NORM", "False").lower()
+        in ("true", "1")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
