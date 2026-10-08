@@ -31,6 +31,9 @@ def test_rocm_aiter_gemma_rmsnorm_falls_back_after_allreduce(
     class FakeQuickReduce:
         disabled = False
 
+        def should_fused_allreduce_rmsnorm(self, inp, residual, weight):
+            return False
+
         def should_quick_allreduce(self, inp):
             raise AssertionError("Gemma norm must not use fused QR+RMSNorm")
 
