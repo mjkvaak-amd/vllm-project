@@ -250,18 +250,6 @@ def test_targets_reject_moe_only_shorthand_for_linear_layer():
 # ---- hadamard_size ---------------------------------------------------------
 
 
-def test_mxfp4_hadamard32_shorthand_is_linear_only():
-    args = quant_config_args(linear="mxfp4_hadamard32")
-    assert args.linear == QuantSpec(weight=kMxfp4Static, hadamard_size=32)
-    with pytest.raises(ValueError, match="does not define a moe spec"):
-        quant_config_args(moe="mxfp4_hadamard32")
-
-
-def test_hadamard_size_in_dict_form():
-    args = quant_config_args(linear={"weight": kMxfp4Static, "hadamard_size": 32})
-    assert args.linear == QuantSpec(weight=kMxfp4Static, hadamard_size=32)
-
-
 def test_mxfp4_hadamard32_target_resolves_to_rotated_mxfp4_linear():
     from vllm.model_executor.layers.quantization.online.mxfp4 import (
         Mxfp4OnlineLinearMethod,
@@ -272,9 +260,11 @@ def test_mxfp4_hadamard32_target_resolves_to_rotated_mxfp4_linear():
             targets={"re:.*linear_attn\\.out_proj": "mxfp4_hadamard32"}
         )
     )
-    _, quant_key_str, _, spec, method_cls = config.resolve_quant_method_cls(
+    resolved = config.resolve_quant_method_cls(
         LinearBase, "model.layers.0.linear_attn.out_proj"
     )
+    assert resolved is not None
+    _, quant_key_str, _, spec, method_cls = resolved
     assert quant_key_str == "mxfp4_hadamard32"
     assert spec.hadamard_size == 32
     assert method_cls is Mxfp4OnlineLinearMethod

@@ -412,6 +412,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
 
             assert issubclass(quant_method_cls, OnlineLinearBase)
             if quant_spec.hadamard_size is not None:
+                assert issubclass(quant_method_cls, Mxfp4OnlineLinearMethod)
                 return quant_method_cls(hadamard_size=quant_spec.hadamard_size)
             return quant_method_cls()
 
