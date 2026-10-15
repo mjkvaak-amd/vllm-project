@@ -10,6 +10,7 @@ against the pure-torch reference in `reference_mxfp4.py`.
 import pytest
 import torch
 
+from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.model_executor.kernels.linear import _POSSIBLE_MXFP4_KERNELS
@@ -657,6 +658,8 @@ def _online_mxfp4_linear(
     method = Mxfp4OnlineLinearMethod(hadamard_size=hadamard_size)
     assert isinstance(method.kernel, AiterMxfp4LinearKernel)
     method.kernel.use_asm_gemm = use_asm_gemm
+    # The ASM GEMM writes bf16 only; serving sets the default dtype to bf16.
+    method.kernel.out_dtype = torch.bfloat16
     method.create_weights(
         layer=layer,
         input_size_per_partition=input_size,
@@ -699,10 +702,30 @@ def test_online_mxfp4_hadamard_aiter(
             hadamard_rotate(weight, h), hadamard_rotate(x, h), None, use_asm_gemm
         )
 
-    assert method.kernel.fuses_input_hadamard()
+    assert method.kernel.fuses_input_hadamard() == use_asm_gemm
 
     def rel_err(y: torch.Tensor) -> float:
         return ((y.float() - want).norm() / want.norm()).item()
 
     assert rel_err(rotated) < 0.7 * rel_err(plain), (rel_err(rotated), rel_err(plain))
     assert ((rotated.float() - explicit.float()).norm() / want.norm()).item() < 1e-2
+
+
+@pytest.mark.skipif(
+    not is_aiter_found_and_supported(),
+    reason="gemm_with_dynamic_quant is registered only with AITER.",
+)
+def test_gemm_with_dynamic_quant_fake_dtype():
+    """torch.compile sizes the op's output from its fake; a fake that reports
+    another dtype than the real op makes the compiled graph read past it."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode(), torch.device(current_platform.device_type):
+        x = torch.empty(16, 64, dtype=torch.bfloat16)
+        weight = torch.empty(32, 32, dtype=torch.uint8)
+        weight_scale = torch.empty(32, 2, dtype=torch.uint8)
+        y = torch.ops.vllm.gemm_with_dynamic_quant(
+            x, weight, weight_scale, True, torch.bfloat16, hadamard_rotate=True
+        )
+    assert y.dtype == torch.bfloat16
+    assert y.shape == (16, 32)
