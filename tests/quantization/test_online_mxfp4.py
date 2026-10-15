@@ -33,6 +33,8 @@ from vllm.model_executor.layers.quantization.quark.utils import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     downcast_to_mxfp,
+    hadamard_matrix,
+    hadamard_rotate,
     mxfp4_quantize,
     quant_dequant_mxfp4,
 )
@@ -627,3 +629,80 @@ def test_quark_ocp_mx_dense_rejects_unaligned_input_partition():
             params_dtype=torch.bfloat16,
             weight_loader=lambda *_: None,
         )
+
+
+def test_hadamard_rotate_preserves_products():
+    h = hadamard_matrix(32, torch.device("cpu"))
+    torch.testing.assert_close(h @ h.T, torch.eye(32))
+    assert torch.equal(h.abs(), torch.full_like(h, 32**-0.5))
+
+    x = torch.randn(8, 256, dtype=torch.float64)
+    w = torch.randn(16, 256, dtype=torch.float64)
+    torch.testing.assert_close(
+        hadamard_rotate(x, h).double() @ hadamard_rotate(w, h).double().T,
+        x @ w.T,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def _online_mxfp4_linear(
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    hadamard_size: int | None,
+    use_asm_gemm: bool,
+) -> tuple[Mxfp4OnlineLinearMethod, torch.Tensor]:
+    output_size, input_size = weight.shape
+    layer = torch.nn.Module()
+    method = Mxfp4OnlineLinearMethod(hadamard_size=hadamard_size)
+    assert isinstance(method.kernel, AiterMxfp4LinearKernel)
+    method.kernel.use_asm_gemm = use_asm_gemm
+    method.create_weights(
+        layer=layer,
+        input_size_per_partition=input_size,
+        output_partition_sizes=[output_size],
+        input_size=input_size,
+        output_size=output_size,
+        params_dtype=torch.bfloat16,
+        weight_loader=default_weight_loader,
+    )
+    replace_parameter(layer, "weight", weight.clone())
+    method.process_weights_after_loading(layer)
+    return method, method.apply(layer, x)
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and current_platform.supports_mx()),
+    reason="AITER MXFP4 GEMMs need a ROCm GPU with MX support.",
+)
+@pytest.mark.parametrize("use_asm_gemm", [True, False])
+@pytest.mark.parametrize("num_tokens", [16, 256])
+def test_online_mxfp4_hadamard_aiter(
+    use_asm_gemm: bool, num_tokens: int, default_vllm_config, dist_init
+):
+    """The rotated layer computes the same GEMM with less MXFP4 error, and
+    matches the unrotated kernel run on explicitly rotated operands."""
+    default_vllm_config.model_config = ModelConfig()
+    input_size, output_size = 2048, 256
+    torch.manual_seed(0)
+    with torch.device(current_platform.device_type):
+        x = torch.randn(num_tokens, input_size, dtype=torch.bfloat16)
+        x[:, torch.randperm(input_size)[:16]] *= 50.0
+        weight = torch.randn(output_size, input_size, dtype=torch.bfloat16) * 0.02
+        weight[:, torch.randperm(input_size)[:16]] *= 10.0
+        want = x.float() @ weight.float().T
+
+        _, plain = _online_mxfp4_linear(weight, x, None, use_asm_gemm)
+        method, rotated = _online_mxfp4_linear(weight, x, 32, use_asm_gemm)
+        h = hadamard_matrix(32, x.device)
+        _, explicit = _online_mxfp4_linear(
+            hadamard_rotate(weight, h), hadamard_rotate(x, h), None, use_asm_gemm
+        )
+
+    assert method.kernel.fuses_input_hadamard()
+
+    def rel_err(y: torch.Tensor) -> float:
+        return ((y.float() - want).norm() / want.norm()).item()
+
+    assert rel_err(rotated) < 0.7 * rel_err(plain), (rel_err(rotated), rel_err(plain))
+    assert ((rotated.float() - explicit.float()).norm() / want.norm()).item() < 1e-2

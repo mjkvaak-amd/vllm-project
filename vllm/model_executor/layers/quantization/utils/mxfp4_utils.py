@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 from typing import Any
 
 import torch
@@ -533,3 +534,29 @@ def mxfp4_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     quant_tensor, scale, _ = downcast_to_mxfp(x, axis=-1)
 
     return quant_tensor, scale
+
+
+@functools.cache
+def hadamard_matrix(size: int, device: torch.device) -> torch.Tensor:
+    """Orthonormal Sylvester Hadamard matrix, ``scipy.linalg.hadamard(size)``
+    scaled by ``1 / sqrt(size)``, in fp32. ``size`` must be a power of two."""
+    if size <= 0 or size & (size - 1):
+        raise ValueError(f"Hadamard size must be a power of two, got {size}")
+    h = torch.ones(1, 1, dtype=torch.float32, device=device)
+    while h.shape[0] < size:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    return h / size**0.5
+
+
+def hadamard_rotate(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
+    """Rotate each contiguous ``hadamard.shape[0]``-wide block of the last
+    dimension of ``x`` by ``hadamard``, computed in fp32 and returned in
+    ``x.dtype``.
+
+    Applied to both the activation and the weight input dimension, the
+    rotation leaves ``x @ w.T`` unchanged while spreading outliers across
+    each block, which shrinks the block-scaled quantization error.
+    """
+    size = hadamard.shape[0]
+    rotated = x.float().unflatten(-1, (-1, size)) @ hadamard
+    return rotated.flatten(-2).to(x.dtype)

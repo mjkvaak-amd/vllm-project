@@ -15,6 +15,9 @@ from vllm.model_executor.kernels.linear import (
     init_mxfp6_linear_kernel,
     init_mxfp8_linear_kernel,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+    hadamard_matrix,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
@@ -37,6 +40,7 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PackedvLLMParameter,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 from .quark_scheme import QuarkScheme
@@ -54,9 +58,17 @@ class QuarkOCP_MX(QuarkScheme):
         weight_quant_key: QuantKey,
         activation_quant_key: QuantKey | None,
         scale_block_rows: int = 1,
+        input_rotation_size: int | None = None,
     ):
         super().__init__(weight_quant_key, activation_quant_key)
         self.scale_block_rows = scale_block_rows
+        if input_rotation_size is not None and weight_quant_key != kMxfp4Static:
+            raise NotImplementedError(
+                "Online input rotation is only supported with MXFP4 weights."
+            )
+        # Quark online rotation: weights are stored rotated along their input
+        # dimension, activations are rotated at runtime.
+        self.input_rotation_size = input_rotation_size
         self.weight_dtype = next(
             dtype
             for dtype, quant_key in _WEIGHT_QUANT_KEY_MAP.items()
@@ -148,10 +160,36 @@ class QuarkOCP_MX(QuarkScheme):
     def get_min_capability(cls) -> int:
         return 70
 
+    def _load_input_rotation(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, *args, **kwargs
+    ) -> None:
+        """Every shard of a fused layer carries the same rotation, and it must
+        be the Sylvester Hadamard matrix the activation rotation applies."""
+        size = self.input_rotation_size
+        assert size is not None
+        expected = (hadamard_matrix(size, loaded_weight.device) * size**0.5).round()
+        if not torch.equal(loaded_weight.float(), expected):
+            raise NotImplementedError(
+                "Only the Sylvester Hadamard input rotation (Quark RotationConfig "
+                "with random_r1=False, trainable=False) is supported."
+            )
+        param.data.copy_(loaded_weight)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
 
+        if self.input_rotation_size is not None:
+            if not layer.input_rotation.any():
+                raise ValueError(
+                    "The checkpoint did not provide the input_rotation of an "
+                    "online-rotated MXFP4 layer."
+                )
+            del layer.input_rotation
+
         self.ocp_mx_linear.process_weights_after_loading(layer)
+        if self.input_rotation_size is not None:
+            assert isinstance(self.ocp_mx_linear, MxFp4LinearKernel)
+            self.ocp_mx_linear.setup_input_hadamard(layer)
 
     def create_weights(
         self,
@@ -235,9 +273,29 @@ class QuarkOCP_MX(QuarkScheme):
             )
             layer.register_parameter("weight_scale", weight_scale)
 
+        if self.input_rotation_size is not None:
+            if input_size_per_partition % self.input_rotation_size != 0:
+                raise ValueError(
+                    f"Input size per partition {input_size_per_partition} is not "
+                    f"divisible by the input rotation size {self.input_rotation_size}."
+                )
+            input_rotation = torch.nn.Parameter(
+                torch.zeros(
+                    self.input_rotation_size,
+                    self.input_rotation_size,
+                    dtype=torch.int8,
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(
+                input_rotation, {"weight_loader": self._load_input_rotation}
+            )
+            layer.register_parameter("input_rotation", input_rotation)
+
         if self.weight_quant_key == kMxfp4Static:
             self.ocp_mx_linear = init_mxfp4_linear_kernel(
                 activation_quant_key=self.activation_quant_key,
+                input_hadamard_size=self.input_rotation_size,
             )
         elif self.weight_quant_key in [kMxfp6E2M3Static, kMxfp6E3M2Static]:
             self.ocp_mx_linear = init_mxfp6_linear_kernel(
@@ -261,4 +319,7 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.input_rotation_size is not None:
+            assert isinstance(self.ocp_mx_linear, MxFp4LinearKernel)
+            x = self.ocp_mx_linear.rotate_input(layer, x)
         return self.ocp_mx_linear.apply_weights(layer, x, bias)

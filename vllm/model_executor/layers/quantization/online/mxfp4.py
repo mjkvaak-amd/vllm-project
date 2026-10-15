@@ -34,6 +34,8 @@ from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+    hadamard_matrix,
+    hadamard_rotate,
     mxfp4_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
@@ -78,14 +80,21 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase):
     """Online MXFP4 linear method.
     Loads bf16/fp16 checkpoints and quantizes weights to MXFP4 (microscaling
     FP4 with block-32 scales) during weight loading.
+
+    With ``hadamard_size``, the weight is rotated along its input dimension by
+    an orthonormal block Hadamard matrix before quantization, and activations
+    are rotated by the same matrix at runtime (fused into the activation
+    quantization where the kernel supports it).
     """
 
     activation_quant_key = kMxfp4Dynamic
 
-    def __init__(self):
+    def __init__(self, hadamard_size: int | None = None):
         super().__init__()
+        self.hadamard_size = hadamard_size
         self.kernel = init_mxfp4_linear_kernel(
-            activation_quant_key=self.activation_quant_key
+            activation_quant_key=self.activation_quant_key,
+            input_hadamard_size=hadamard_size,
         )
 
     def create_weights(
@@ -120,6 +129,10 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase):
             return
 
         weight = self.get_weight_for_quantization(layer)
+        if self.hadamard_size is not None:
+            weight = hadamard_rotate(
+                weight, hadamard_matrix(self.hadamard_size, weight.device)
+            )
         weight_fp4, weight_scale = mxfp4_quantize(weight.contiguous())
 
         layer.input_scale = None
@@ -127,6 +140,7 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase):
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
         self.kernel.process_weights_after_loading(layer)
+        self.kernel.setup_input_hadamard(layer)
 
         layer._already_called_process_weights_after_loading = True
 
@@ -136,6 +150,7 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        x = self.kernel.rotate_input(layer, x)
         return self.kernel.apply_weights(layer, x, bias)
 
 

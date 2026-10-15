@@ -7,6 +7,7 @@ from torch.nn.parameter import Parameter
 import vllm.envs as envs
 from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils import mxfp4_utils
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Dynamic,
 )
@@ -48,7 +49,14 @@ if is_aiter_found_and_supported():
         rocm_use_aiter_fp4_asm_gemm: bool = False,
         out_dtype: torch.dtype | None = torch.bfloat16,
         x_scales: torch.Tensor | None = None,
+        hadamard_rotate: bool = False,
     ) -> torch.Tensor:
+        """``hadamard_rotate`` rotates ``x`` per 32-element block (see
+        `mxfp4_utils.hadamard_rotate`) before quantizing it; ``weight`` must
+        have been rotated the same way."""
+        assert not (hadamard_rotate and x_scales is not None), (
+            "hadamard_rotate needs an unquantized x"
+        )
         from aiter.ops.triton.gemm_afp4wfp4 import (
             gemm_afp4wfp4,
             gemm_afp4wfp4_preshuffle,
@@ -70,10 +78,9 @@ if is_aiter_found_and_supported():
             ):
                 if x_scales is None:
                     # use hip quant kernel for performance
-                    if M >= 32:
-                        x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
-                    else:
-                        x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=False)
+                    x_q, x_s = per_1x32_f4_quant_hip(
+                        x, shuffle=M >= 32, hadamard_rotate=hadamard_rotate
+                    )
                 else:
                     x_q = x
                     x_s = x_scales
@@ -97,7 +104,9 @@ if is_aiter_found_and_supported():
             else:
                 if x_scales is None:
                     # use hip quant kernel for performance
-                    x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
+                    x_q, x_s = per_1x32_f4_quant_hip(
+                        x, shuffle=True, hadamard_rotate=hadamard_rotate
+                    )
                 else:
                     x_q = x
                     x_s = x_scales
@@ -112,6 +121,10 @@ if is_aiter_found_and_supported():
                 )
             return y[:M]
         else:
+            if hadamard_rotate:
+                x = mxfp4_utils.hadamard_rotate(
+                    x, mxfp4_utils.hadamard_matrix(32, x.device)
+                )
             if x_scales is None:
                 x_q, x_s = dynamic_mxfp4_quant(x)
             else:
@@ -140,6 +153,7 @@ if is_aiter_found_and_supported():
         x_scales: torch.Tensor = None,
         rocm_use_aiter_fp4_asm_gemm: bool = False,
         out_dtype: torch.dtype | None = torch.bfloat16,
+        hadamard_rotate: bool = False,
     ) -> torch.Tensor:
         return torch.empty(
             (*x.shape[:-1], weight.shape[0]), dtype=out_dtype, device=x.device
@@ -198,6 +212,9 @@ class AiterMxfp4LinearKernel(MxFp4LinearKernel):
             return False, "only supports MXFP4 dynamic activation"
         return True, None
 
+    def fuses_input_hadamard(self) -> bool:
+        return self.config.input_hadamard_size == 32
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.use_asm_gemm and not _asm_fp4_scale_swizzle_supported(
             layer.weight_scale.data
@@ -243,6 +260,7 @@ class AiterMxfp4LinearKernel(MxFp4LinearKernel):
             layer.weight_scale,
             self.use_asm_gemm,
             self.out_dtype,
+            hadamard_rotate=self.fuses_input_hadamard(),
         )
         if bias is not None:
             y = y + bias

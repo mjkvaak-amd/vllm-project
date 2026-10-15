@@ -261,6 +261,13 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 f"activation override (activation={spec.activation}) is not "
                 f"yet supported for online {cls.__name__}"
             )
+        if spec.hadamard_size is not None and not (
+            cls is Mxfp4OnlineLinearMethod and spec.hadamard_size == 32
+        ):
+            raise ValueError(
+                f"hadamard_size={spec.hadamard_size} is not supported for online "
+                f"{cls.__name__}; only hadamard_size=32 with MXFP4 linear layers is"
+            )
         return cls
 
     def resolve_quant_method_cls(
@@ -391,7 +398,9 @@ class OnlineQuantizationConfig(QuantizationConfig):
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
         resolved = self.resolve_quant_method_cls(type(layer), prefix)
         if resolved is not None:
-            source, quant_key_str, target_pattern, _, quant_method_cls = resolved
+            source, quant_key_str, target_pattern, quant_spec, quant_method_cls = (
+                resolved
+            )
             self.quantized_layers[prefix] = (
                 source.value,
                 quant_key_str,
@@ -402,6 +411,8 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 return quant_method_cls(moe=layer.moe_config)
 
             assert issubclass(quant_method_cls, OnlineLinearBase)
+            if quant_spec.hadamard_size is not None:
+                return quant_method_cls(hadamard_size=quant_spec.hadamard_size)
             return quant_method_cls()
 
         if isinstance(layer, LinearBase):
