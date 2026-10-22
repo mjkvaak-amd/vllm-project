@@ -54,9 +54,9 @@ def flydsl_select_paged_tokens(
     qsa = _flydsl_qsa()
     if qsa is None:
         return None
-    reason = qsa.qsa_k1_selection_serves(
+    reason = qsa.qsa_indexer_selection_supported(
         token_topk, compress_ratio
-    ) or qsa.qsa_k1_serves(q, k_cache, page_table)
+    ) or qsa.qsa_indexer_supported(q, k_cache, page_table)
     if reason is not None:
         logger.warning_once("FlyDSL QSA K1 skipped: %s", reason)
         return None
@@ -83,7 +83,7 @@ def flydsl_select_paged_tokens(
     for row_start in range(0, rows, rows_per_chunk):
         rows_slice = slice(row_start, min(row_start + rows_per_chunk, rows))
         blocks = blocks_buffer[: rows_slice.stop - row_start]
-        qsa.qsa_k1_block_ids(
+        qsa.qsa_indexer_block_ids(
             q[rows_slice],
             k_cache,
             page_table,
@@ -121,12 +121,14 @@ def flydsl_sparse_paged_attention(
     if not out.is_contiguous() or not logical_indices.is_contiguous():
         logger.warning_once("FlyDSL QSA K2 skipped: strided output or indices.")
         return False
-    reason = qsa.qsa_k2_serves(q, k_cache, v_cache, logical_indices, block_table)
+    reason = qsa.qsa_sparse_gqa_supported(
+        q, k_cache, v_cache, logical_indices, block_table
+    )
     if reason is not None:
         logger.warning_once("FlyDSL QSA K2 skipped: %s", reason)
         return False
     logger.info_once("Using AITER FlyDSL QSA K2 sparse GQA.")
-    qsa.qsa_k2(
+    qsa.qsa_sparse_gqa(
         q,
         k_cache,
         v_cache,
