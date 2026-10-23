@@ -97,6 +97,19 @@ def _supports_router_bf16x3_device() -> bool:
     return on_gfx950()
 
 
+@functools.cache
+def _use_aiter_tuned_gemm() -> bool:
+    if not current_platform.is_rocm():
+        return False
+
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.platforms.rocm import on_gfx942
+
+    # AITER's tuned BF16 table falls back to PyTorch linear for untuned shapes
+    # on gfx942; on gfx950 its default backend differs, so keep PyTorch there.
+    return on_gfx942() and rocm_aiter_ops.is_linear_enabled()
+
+
 def norm_residual_then_norm(
     x: MuseSpark1xResidualStream,
     pre_norm: MuseSpark1xRMSNorm,
@@ -137,7 +150,8 @@ def norm_residual_then_norm(
 
 
 class MuseSparkTorchLinearMethod(UnquantizedLinearMethod):
-    """Run Muse Spark's compression projections through PyTorch linear."""
+    """Run Muse Spark's compression projections through PyTorch linear, or
+    through AITER's tuned BF16 GEMM table on gfx942."""
 
     def apply(
         self,
@@ -145,6 +159,10 @@ class MuseSparkTorchLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if _use_aiter_tuned_gemm():
+            from aiter.tuned_gemm import tgemm
+
+            return tgemm.mm(x, layer.weight, bias)
         return F.linear(x, layer.weight, bias)
 
 
