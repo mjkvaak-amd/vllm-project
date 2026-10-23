@@ -92,9 +92,9 @@ def _supports_router_bf16x3_device() -> bool:
         return False
 
     # Importing a foreign platform can reload torch extension libraries.
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx942, on_gfx950
 
-    return on_gfx950()
+    return on_gfx950() or on_gfx942()
 
 
 def norm_residual_then_norm(
