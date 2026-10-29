@@ -13,6 +13,7 @@ from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.config.quantization import resolve_quantization_config
 from vllm.config.utils import config, replace
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config, iter_rope_parameters
@@ -436,6 +437,11 @@ class SpeculativeConfig:
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
     takes effect when using the draft model-based speculative method."""
+    quantization_config: dict[str, Any] | None = None
+    """Online quantization for the draft model, in `--quantization-config`'s
+    format (e.g. `{"targets": {"mtp.*.experts": "mxfp4"}}`), composed with
+    the draft checkpoint's quantization as for the target. The target's
+    `--quantization-config` does not apply to the draft model."""
     moe_backend: MoEBackend | None = None
     """MoE backend to use for the draft model. When `None`, the draft model
     inherits the target model's `--moe-backend` setting. Useful when the
@@ -1386,6 +1392,9 @@ class SpeculativeConfig:
                     max_model_len=self.max_model_len,  # type: ignore[arg-type]
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
+                    quantization_config=resolve_quantization_config(
+                        self.quantization, self.quantization_config
+                    ),
                     enforce_eager=self.target_model_config.enforce_eager,
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
