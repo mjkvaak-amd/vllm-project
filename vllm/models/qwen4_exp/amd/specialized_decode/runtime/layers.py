@@ -211,7 +211,9 @@ def _block_out(state):
 def gdn_verify_core(a, x) -> torch.Tensor:
     """``QwenGatedDeltaNetAttention.forward_hip`` up to out_proj's input on an
     MTP verify step (vLLM's GDN core applies the spec-decode metadata: each
-    draft's state slot, the accepted-token offsets) -> core [S, NV HD]. The
+    draft's state slot, the accepted-token offsets) -> core [S, NV HD]. With
+    the fused spec-decode GDN kernel the core reads the packed projections and
+    applies the gated norm itself, as ``forward_cuda`` does; otherwise the
     gated norm is ``RMSNormGated``'s Triton kernel, one launch."""
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         _encode_layer_name,
@@ -221,6 +223,19 @@ def gdn_verify_core(a, x) -> torch.Tensor:
     qkvz, _ = a.in_proj_qkvz(x)
     ba, _ = a.in_proj_ba(x)
     heads = a.num_v_heads // a.tp_size
+    if (
+        a.enable_fused_gdn_spec_decode
+        and x.dtype == torch.bfloat16
+        and a.norm.weight.dtype in (torch.bfloat16, torch.float32)
+    ):
+        core = x.new_zeros(n, heads, a.head_v_dim)
+        torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
+            qkvz.view(n, -1),
+            ba.view(n, -1),
+            core,
+            layer_name=_encode_layer_name(a.prefix),
+        )
+        return core.view(n, -1)
     core = x.new_empty(n, heads, a.head_v_dim)
     z = torch.empty_like(core)
     torch.ops.vllm.qwen_gdn_attention_core(
