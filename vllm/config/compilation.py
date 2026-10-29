@@ -139,6 +139,14 @@ class PassConfig:
     """Enable fused Q/K RMSNorm + RoPE pass."""
     fuse_rope_kvcache_cat_mla: bool = None  # type: ignore[assignment]
     """Enable fused MLA KV cache update with RoPE."""
+    fuse_gemm_silu_mul: bool = None  # type: ignore[assignment]
+    """Fuse an unquantized merged gate_up GEMM with the SiluAndMul that consumes
+    it into one Triton kernel that computes both halves from a shared A tile.
+    Per shape, the kernel is timed against the unfused path and only used where
+    it is faster."""
+    gemm_silu_mul_max_token_num: int = 64
+    """GEMM + SiluAndMul fusion only applies to compile ranges up to this many
+    tokens (decode); larger batches keep the vendor GEMM."""
 
     # ROCm/AITER specific fusions
     fuse_act_padding: bool = None  # type: ignore[assignment]
@@ -226,6 +234,7 @@ class PassConfig:
         "fuse_qk_norm_rope_kvcache",
         "enable_qk_norm_rope_fusion",
         "fuse_rope_kvcache_cat_mla",
+        "fuse_gemm_silu_mul",
         mode="wrap",
     )
     @classmethod
@@ -297,6 +306,12 @@ class PassConfig:
                 "current platform is not CUDA or ROCm. The fusion will be disabled."
             )
             self.fuse_rope_kvcache_cat_mla = False
+        if self.fuse_gemm_silu_mul and not current_platform.is_cuda_alike():
+            logger.warning_once(
+                "GEMM + SiluAndMul fusion enabled but the current platform is "
+                "not CUDA or ROCm. The fusion will be disabled."
+            )
+            self.fuse_gemm_silu_mul = False
 
     def log_enabled_passes(self) -> None:
         """Log the enabled custom fusion passes.

@@ -257,6 +257,7 @@ OPTIMIZATION_LEVEL_00 = {
             "fuse_qk_norm_rope_kvcache": False,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
+            "fuse_gemm_silu_mul": False,
         },
         "cudagraph_mode": CUDAGraphMode.NONE,
         "use_inductor_graph_partition": False,
@@ -278,6 +279,7 @@ OPTIMIZATION_LEVEL_01 = {
             "fuse_qk_norm_rope_kvcache": False,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
+            "fuse_gemm_silu_mul": False,
         },
         "cudagraph_mode": CUDAGraphMode.PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -299,6 +301,7 @@ OPTIMIZATION_LEVEL_02 = {
             "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
+            "fuse_gemm_silu_mul": False,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -320,6 +323,7 @@ OPTIMIZATION_LEVEL_03 = {
             "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
+            "fuse_gemm_silu_mul": False,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -2630,6 +2634,11 @@ class VllmConfig:
                         "num_tokens <= %d.",
                         compile_range_end,
                     )
+
+        if compilation_config.pass_config.fuse_gemm_silu_mul:
+            max_token_num = compilation_config.pass_config.gemm_silu_mul_max_token_num
+            if compile_range_end is not None and max_token_num < compile_range_end:
+                computed_compile_ranges_endpoints.append(max_token_num)
 
         if compilation_config.compile_ranges_endpoints is not None:
             for x in compilation_config.compile_ranges_endpoints:
