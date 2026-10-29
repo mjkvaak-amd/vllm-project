@@ -858,6 +858,10 @@ class Qwen4ExpForCausalLM(
         self.after_specialized_decode_step()
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.after_specialized_decode_step()
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
 
