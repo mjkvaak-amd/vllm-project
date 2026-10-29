@@ -290,3 +290,44 @@ def _verify_metadata(reqs=2, q=4, uniform=True, decodes=0, prefills=0):
 )
 def test_verify_step_reason(md, width, why):
     assert step_reason(md, "gdn", width, q=4) == why
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_gdn_verify_core_uses_fused_spec_decode(monkeypatch, fused):
+    import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn  # noqa: F401
+    from vllm.models.qwen4_exp.amd.specialized_decode.runtime.layers import (
+        gdn_verify_core,
+    )
+
+    n, heads, hd = 8, 4, 16
+    calls = []
+
+    def fused_core(qkvz, ba, core, layer_name):
+        calls.append("fused")
+        core.fill_(1)
+
+    def core_op(qkvz, ba, z, core, layer_name, use_aiter):
+        calls.append("core")
+        core.fill_(2)
+
+    monkeypatch.setattr(
+        torch.ops.vllm, "qwen_gdn_attention_core_fused_norm_packed", fused_core
+    )
+    monkeypatch.setattr(torch.ops.vllm, "qwen_gdn_attention_core", core_op)
+    layer = SimpleNamespace(
+        in_proj_qkvz=lambda x: (x.new_zeros(n, 3 * heads * hd), None),
+        in_proj_ba=lambda x: (x.new_zeros(n, 2 * heads), None),
+        num_v_heads=heads,
+        tp_size=1,
+        head_v_dim=hd,
+        prefix="model.layers.0.linear_attn",
+        enable_fused_gdn_spec_decode=fused,
+        norm=SimpleNamespace(
+            weight=torch.ones(hd, dtype=torch.bfloat16),
+            forward_cuda=lambda core, z: core,
+        ),
+    )
+    core = gdn_verify_core(layer, torch.zeros(n, 32, dtype=torch.bfloat16))
+    assert calls == ["fused" if fused else "core"]
+    assert core.shape == (n, heads * hd)
+    assert bool((core == (1 if fused else 2)).all())
