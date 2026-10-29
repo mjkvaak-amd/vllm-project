@@ -4907,6 +4907,7 @@ steps:
     models/qwen4_exp/test_qsa_prepare_amd.py
   # PLE and QSA import conflicting HC registrations in a shared process.
   - pytest -v -s models/qwen4_exp/test_ple.py
+  - pytest -v -s models/qwen4_exp/test_mtp_local_argmax.py
 
 - label: ":amd: (MI355 DPX) GLM5Next"
   timeout_in_minutes: 35
