@@ -3,6 +3,7 @@
 import gc
 import time
 from abc import ABC, abstractmethod
+from collections import Counter
 
 import torch
 import torch.nn as nn
@@ -55,7 +56,11 @@ class BaseModelLoader(ABC):
             model_config=model_config,
             prefix=prefix,
         )
-        log_online_quantization(vllm_config)
+        if model_config is vllm_config.model_config:
+            log_online_quantization(vllm_config)
+        else:
+            # vllm_config.quant_config is the target's when loading a draft model
+            log_module_online_quantization(model)
         log_model_inspection(model)
         return model
 
@@ -107,7 +112,8 @@ class BaseModelLoader(ABC):
                 finalize_layerwise_processing(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)
-            log_online_quantization_time(vllm_config)
+            if model_config is vllm_config.model_config:
+                log_online_quantization_time(vllm_config)
 
             gc.collect()
             torch.accelerator.empty_cache()
@@ -153,6 +159,29 @@ def log_online_quantization(vllm_config: VllmConfig) -> None:
         len(quant_config.quantized_layers),
         "; ".join(quant_config.quantized_layer_summaries),
     )
+
+
+def log_module_online_quantization(model: nn.Module) -> None:
+    """Log the online-quantized layer count of a model by its quant methods."""
+    from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
+    from vllm.model_executor.layers.quantization.online.moe_base import (
+        OnlineMoEMethodBase,
+    )
+
+    counts = Counter(
+        type(module.quant_method).__name__
+        for module in model.modules()
+        if isinstance(
+            getattr(module, "quant_method", None),
+            (OnlineLinearBase, OnlineMoEMethodBase),
+        )
+    )
+    if counts:
+        logger.info(
+            "Quantizing %d layers online: %s",
+            sum(counts.values()),
+            ", ".join(f"{name}: {n}" for name, n in sorted(counts.items())),
+        )
 
 
 def log_online_quantization_time(vllm_config: VllmConfig) -> None:
