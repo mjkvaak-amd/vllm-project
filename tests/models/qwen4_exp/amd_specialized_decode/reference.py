@@ -283,6 +283,87 @@ def _gdn_core_ref(w, n: int, qkvz, ba, nk: int, nv: int, gate: str):
     return conv_state, rstate, norm.forward_native(core, z).reshape(s, nv * HD)
 
 
+def _gdn_verify_inputs(s: int, q: int, reqs: int, shuffled: bool = True):
+    """``_gdn_inputs`` for an MTP verify step of ``s / q`` requests of ``q``
+    rows, the first ``reqs`` real (accepted 1 .. q in turn; slots 3 .., q a
+    request), the rest a graph's pad (the null slot, one accepted)."""
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import (
+        HD,
+        Layout,
+    )
+
+    lay = Layout(TP)
+    n = s // q
+    slots = 3 + n * q + 2
+    w = _gdn_inputs(s, s, slots=slots, shuffled=shuffled)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    nst = lay.NV * HD * HD
+    pad = _randn(g, slots, nst + 8192, scale=0.05, dtype=torch.float32)
+    w["rstate"] = pad[:, :nst].view(slots, lay.NV, HD, HD)
+    sl = 3 + q - 1
+    conv = _randn(g, slots, lay.CONV * sl + 1024)[:, : lay.CONV * sl]
+    w["conv_state"] = conv.view(slots, sl, lay.CONV).transpose(-1, -2)
+    # rows strided, as the block table's first q columns
+    table = torch.zeros(n, q + 5, dtype=torch.int32, device="cuda")
+    for r in range(reqs):
+        table[r, :q] = torch.arange(3 + r * q, 3 + (r + 1) * q, dtype=torch.int32)
+    w["spec_idx"] = table[:, :q]
+    acc = torch.ones(n, dtype=torch.int32, device="cuda")
+    acc[:reqs] = torch.arange(reqs, dtype=torch.int32, device="cuda") % q + 1
+    w["n_acc"] = acc
+    return w
+
+
+def _gdn_verify_core_ref(w, qkvz, ba, nk: int, nv: int, q: int):
+    """The spec-decode GDN core vLLM runs on ROCm from in_proj's outputs (the conv
+    update with the accepted offsets, ``fused_gdn_decode_post_conv_mtp`` with
+    the sigmoid-gated norm) -> (conv state, SSM state, core [S, NV HD])."""
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        causal_conv1d_update,
+    )
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import HD
+    from vllm.third_party.flash_linear_attention.ops.fused_gdn_decode_post_conv_mtp import (  # noqa: E501
+        fused_gdn_decode_post_conv_mtp_triton,
+    )
+
+    s = qkvz.size(0)
+    qkv = (2 * nk + nv) * HD
+    conv_state, rstate = w["conv_state"].clone(), w["rstate"].clone()
+    idx, acc = w["spec_idx"], w["n_acc"]
+    cu = torch.arange(0, s + 1, q, dtype=torch.int32, device="cuda")
+    mixed = causal_conv1d_update(
+        qkvz[:, :qkv].contiguous(),
+        conv_state,
+        w["conv_w"].view(-1, 4),
+        None,
+        "silu",
+        conv_state_indices=idx[:, 0],
+        num_accepted_tokens=acc,
+        query_start_loc=cu,
+        max_query_len=q,
+    )
+    b, a = ba.chunk(2, dim=-1)
+    core = torch.empty(s, nv, HD, dtype=bf, device="cuda")
+    fused_gdn_decode_post_conv_mtp_triton(
+        mixed_qkv=mixed,
+        a=a,
+        b=b,
+        A_log=w["a_log"],
+        dt_bias=w["dt_bias"],
+        state_indices=idx.contiguous(),
+        cu_seqlens=cu,
+        num_accepted_tokens=acc,
+        state=rstate,
+        output_gate=qkvz[:, qkv:].reshape(s, nv, HD),
+        norm_weight=w["norm_w"],
+        out=core,
+        scale=HD**-0.5,
+        norm_eps=1e-6,
+        output_gate_activation="sigmoid",
+    )
+    return conv_state, rstate, core.reshape(s, nv * HD)
+
+
 def _u8(g, *shape, lo=0, hi=256):
     return torch.randint(lo, hi, shape, generator=g, device=g.device).to(torch.uint8)
 

@@ -103,6 +103,7 @@ class GdnBuild:
     tp: int = 2
     norm_eps: float = 1e-6
     shuffled: bool = True  # in_proj_qkvz in the ASM FP4 GEMM layout, else Triton's
+    q: int = 1  # rows a request: > 1 an MTP verify step (num_speculative_tokens + 1)
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,8 @@ GDN_ABI = KernelAbi(
         "rstate",
         "rs_seq",
         "st_idx",
+        "si_row",
+        "n_acc",
         "core",
         "scratch",
         "epoch",
@@ -291,15 +294,17 @@ _GDN: dict = {}
 def build_gdn(key: GdnBuild):
     if key in _GDN:
         return _GDN[key]
-    s = key.tokens
+    s, q = key.tokens, key.q
     need(1 <= s <= MAXT, f"{s} rows, the kernels take 1..{MAXT}")
+    need(q >= 1 and s % q == 0, f"{s} rows are not whole requests of {q}")
     lay = L.Layout(key.tp)
     scr = gdn_scratch_layout(key)
-    nr = -(-s * P.gdn_tasks_of(lay) // BLOCKS)
+    nr = -(-(s // q) * P.gdn_tasks_of(lay) // BLOCKS)
     nba = P.ba_tasks(lay)
     need(P.BA0 + nba <= BLOCKS, "in_proj_ba's CTAs")
     need(lay.QKVZ // ROWS == 2 * BLOCKS, "in_proj_qkvz: two row groups a CTA")
     xwords = s * XROW // 2
+    slots = nr * q  # a token's LDS slot, q a round
 
     @fx.struct
     class XLds:
@@ -307,10 +312,10 @@ def build_gdn(key: GdnBuild):
 
     @fx.struct
     class GdnLds:
-        qkl: fx.Array[fx.Float32, nr * 2 * HD, 16]
-        vloc: fx.Array[fx.Float32, nr * VCH, 16]
-        ol: fx.Array[fx.Float32, nr * VCH, 16]
-        scal: fx.Array[fx.Float32, nr * 4, 16]
+        qkl: fx.Array[fx.Float32, slots * 2 * HD, 16]
+        vloc: fx.Array[fx.Float32, slots * VCH, 16]
+        ol: fx.Array[fx.Float32, slots * VCH, 16]
+        scal: fx.Array[fx.Float32, slots * 4, 16]
 
     @fx.union
     class StageLds:
@@ -324,7 +329,8 @@ def build_gdn(key: GdnBuild):
     keyed = key_tuple(key, source_digest())
 
     @flyc.kernel(
-        name=f"flashnext_split_gdn_s{s}_t{key.tp}_w{int(key.shuffled)}",
+        name=f"flashnext_split_gdn_s{s}_t{key.tp}_w{int(key.shuffled)}"
+        + (f"_q{q}" if q > 1 else ""),
         known_block_size=[THREADS, 1, 1],
     )
     def kgdn(
@@ -343,6 +349,8 @@ def build_gdn(key: GdnBuild):
         rstate: Int64,
         rs_seq: Int32,
         st_idx: Int64,
+        si_row: Int32,
+        n_acc: Int64,
         core: Int64,
         scratch: Int64,
         epoch: Int64,
@@ -366,7 +374,8 @@ def build_gdn(key: GdnBuild):
             "ba_of": P.ba_of,
             "ba_parts": P.BA_PARTS,
             "z_gate": sigmoid,
-            "goff": P.gdn_offset(s, key.tp),
+            "goff": P.gdn_offset(s // q, key.tp),
+            "q": q,
             "tid": tid,
             "bid": bid,
             "lane": tid % 64,
@@ -396,6 +405,8 @@ def build_gdn(key: GdnBuild):
                 "rstate": rstate,
                 "rs_seq": rs_seq,
                 "st_idx": st_idx,
+                "si_row": si_row,
+                "n_acc": n_acc,
                 "core": core,
             },
         }
@@ -431,6 +442,8 @@ def build_gdn(key: GdnBuild):
         rstate: Int64,
         rs_seq: Int32,
         st_idx: Int64,
+        si_row: Int32,
+        n_acc: Int64,
         core: Int64,
         scratch: Int64,
         epoch: Int64,
@@ -456,6 +469,8 @@ def build_gdn(key: GdnBuild):
             rstate,
             rs_seq,
             st_idx,
+            si_row,
+            n_acc,
             core,
             scratch,
             epoch,
@@ -489,6 +504,7 @@ def gdn_block(
     health,
     alarm,
     layer,
+    n_acc=None,
 ):
     """A GDN layer's ``linear_attn`` up to out_proj's input: ``x`` [S, H] bf16
     (the block input) -> ``core`` [S, CORE] bf16. Every weight as vLLM holds
@@ -497,8 +513,10 @@ def gdn_block(
     [slots, CONV, 3] or a transposed view of [slots, 3, CONV] (strides read);
     ``rstate`` [slots, NV, 128, 128] fp32, a slot dense, slots strided;
     ``st_idx`` [>= S] int32, <= 0 a pad row (no state written, a zero core
-    row); ``epoch`` a device int32 bumped once a step, ``layer`` this
-    launch's tag slot."""
+    row). An MTP verify step (``key.q`` > 1): ``conv_state`` [slots, CONV,
+    3 + q - 1], ``st_idx`` [>= S / q, q] int32 (vLLM's spec state indices, rows
+    strided) and ``n_acc`` [>= S / q] int32 (num_accepted_tokens). ``epoch``
+    a device int32 bumped once a step, ``layer`` this launch's tag slot."""
     s = key.tokens
     lay = L.Layout(key.tp)
     bf = torch.bfloat16
@@ -521,9 +539,11 @@ def gdn_block(
         f"in_proj_ba: bf16 [{lay.BA}, {H}]",
     )
     need(conv_w.numel() == lay.CONV * L.CONV_W and conv_w.dtype == bf, "conv1d weight")
+    q = key.q
+    sl = P.SL + q - 1
     need(
-        conv_state.dtype == bf and conv_state.shape[1:] == (lay.CONV, P.SL),
-        f"conv state: bf16 [slots, {lay.CONV}, 3]",
+        conv_state.dtype == bf and conv_state.shape[1:] == (lay.CONV, sl),
+        f"conv state: bf16 [slots, {lay.CONV}, {sl}]",
     )
     need(
         rstate.dtype == torch.float32 and rstate.shape[1:] == (lay.NV, HD, HD),
@@ -532,7 +552,25 @@ def gdn_block(
     need(rstate[0].is_contiguous(), "a recurrent state slot must be dense")
     need(a_log.dtype == torch.float32 and dt_bias.dtype == bf, "A_log / dt_bias dtype")
     need(norm_w.dtype == bf and norm_w.numel() == HD, "gated norm weight")
-    need(st_idx.dtype == torch.int32 and st_idx.numel() >= s, "state indices")
+    need(st_idx.dtype == torch.int32, "state indices: int32")
+    if q == 1:
+        need(st_idx.numel() >= s, "state indices: one a row")
+        si_row, acc_ptr = 1, 0
+    else:
+        need(
+            st_idx.dim() == 2
+            and st_idx.size(0) >= s // q
+            and st_idx.size(1) == q
+            and st_idx.stride(1) == 1,
+            f"spec state indices: [>= {s // q}, {q}], a row dense",
+        )
+        need(
+            n_acc is not None
+            and n_acc.dtype == torch.int32
+            and n_acc.numel() >= s // q,
+            "num_accepted_tokens: int32, one a request",
+        )
+        si_row, acc_ptr = st_idx.stride(0), n_acc.data_ptr()
     need(
         all(t.is_contiguous() for t in (w_qkvz, w_qkvzs, w_ba, conv_w, core)),
         "a non-contiguous GDN input",
@@ -553,6 +591,8 @@ def gdn_block(
         "rstate": rstate.data_ptr(),
         "rs_seq": rstate.stride(0),
         "st_idx": st_idx.data_ptr(),
+        "si_row": si_row,
+        "n_acc": acc_ptr,
         "core": core.data_ptr(),
         "scratch": scratch.data_ptr(),
         "epoch": epoch.data_ptr(),

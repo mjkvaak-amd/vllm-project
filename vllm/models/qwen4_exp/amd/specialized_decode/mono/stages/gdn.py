@@ -271,27 +271,43 @@ def gdn_gates(c, k, t, h, qkw=None):
     gpu.barrier()
 
 
+def _delta_rule(c, st, live):
+    """One token on the thread's 4 state values ``st``: decay, the delta rule
+    -> (the new state values, o = bf16(h q) of the thread's state row)."""
+    tid = c["tid"]
+    k0 = (tid % 32) * 4
+    decay = fx.ptr_load(c["scal"] + 0)
+    beta = fx.ptr_load(c["scal"] + 1)
+    qv = [fx.ptr_load(c["qkl"] + (k0 + e)) for e in range(4)]
+    kv = [fx.ptr_load(c["qkl"] + (HD + k0 + e)) for e in range(4)]
+    stv = [st[e] * decay for e in range(4)]
+    p = stv[0] * kv[0] + stv[1] * kv[1] + stv[2] * kv[2] + stv[3] * kv[3]
+    p = butterfly(p, (16, 8, 4, 2, 1))
+    vn = (fx.ptr_load(c["vloc"] + tid // 32) - p) * beta
+    stv = [stv[e] + vn * kv[e] for e in range(4)]
+    o = stv[0] * qv[0] + stv[1] * qv[1] + stv[2] * qv[2] + stv[3] * qv[3]
+    o = bf16_round(butterfly(o, (16, 8, 4, 2, 1)))
+    return stv, live.select(o, fx.Float32(0.0))
+
+
+def _onrm_put(c, t, h, ch):
+    """The chunk's sum of squares of ``ol`` -> ONRM (token t, head h)."""
+    ss = fx.Float32(0.0)
+    for e in range_constexpr(VCH):
+        x = fx.ptr_load(c["ol"] + e)
+        ss = ss + x * x
+    c["put"](c["onrm"], (t * c["gdn"].nv + h) * NVCH + ch, ss)
+
+
 @traced
 def gdn_recur(c, k, t, h, ch):
     """State rows 16 ch .. of head h, one token: decay, the delta rule, the new
     state (in place), o = bf16(h q) -> LDS ``ol``, the chunk's sum of squares
     -> ONRM."""
     tid, lane = c["tid"], c["lane"]
-    v = tid // 32
-    k0 = (tid % 32) * 4
     live = k["slot"] > 0
-    decay = fx.ptr_load(c["scal"] + 0)
-    beta = fx.ptr_load(c["scal"] + 1)
-    qv = [fx.ptr_load(c["qkl"] + (k0 + e)) for e in range(4)]
-    kv = [fx.ptr_load(c["qkl"] + (HD + k0 + e)) for e in range(4)]
-    stv = [live.select(k["st"][e], fx.Float32(0.0)) * decay for e in range(4)]
-    p = stv[0] * kv[0] + stv[1] * kv[1] + stv[2] * kv[2] + stv[3] * kv[3]
-    p = butterfly(p, (16, 8, 4, 2, 1))
-    vn = (fx.ptr_load(c["vloc"] + v) - p) * beta
-    stv = [stv[e] + vn * kv[e] for e in range(4)]
-    o = stv[0] * qv[0] + stv[1] * qv[1] + stv[2] * qv[2] + stv[3] * qv[3]
-    o = bf16_round(butterfly(o, (16, 8, 4, 2, 1)))
-    o = live.select(o, fx.Float32(0.0))
+    st = [live.select(k["st"][e], fx.Float32(0.0)) for e in range(4)]
+    stv, o = _delta_rule(c, st, live)
     if live:
         bo.buffer_store(
             fx.Vector.from_elements(stv, fx.Float32),
@@ -299,14 +315,10 @@ def gdn_recur(c, k, t, h, ch):
             k["head_off"],
         )
     if lane % 32 == 0:
-        fx.ptr_store(o, c["ol"] + v)
+        fx.ptr_store(o, c["ol"] + tid // 32)
     gpu.barrier()
     if tid == 0:
-        ss = fx.Float32(0.0)
-        for e in range_constexpr(VCH):
-            x = fx.ptr_load(c["ol"] + e)
-            ss = ss + x * x
-        c["put"](c["onrm"], (t * c["gdn"].nv + h) * NVCH + ch, ss)
+        _onrm_put(c, t, h, ch)
     gpu.barrier()
 
 
@@ -336,17 +348,29 @@ def gdn_norm(c, k, t, h, ch):
     gpu.barrier()
 
 
+LDS_SLOTS = (("qkl", 2 * HD), ("vloc", VCH), ("ol", VCH), ("scal", 4))
+
+
 def gdn_round(c, r):
     """Round r's task of this CTA (``bid - goff`` cyclically + ``BLOCKS r``,
-    clamped into range), its (token, head, chunk) and the round's LDS."""
-    nv = c["gdn"].nv
-    n = c["S"] * nv * NVCH
+    clamped into range), its (token, head, chunk) -- with ``q`` > 1 its
+    (request, head, chunk) -- and the round's LDS (``q`` token slots)."""
+    nv, q = c["gdn"].nv, c["q"]
+    n = c["S"] // q * nv * NVCH
     task = (c["bid"] + (BLOCKS - c["goff"])) % BLOCKS + BLOCKS * r
     tc = fx.min(task, n - 1)
     cr = dict(c)
-    for name, m in (("qkl", 2 * HD), ("vloc", VCH), ("ol", VCH), ("scal", 4)):
-        cr[name] = c[name] + r * m
+    for name, m in LDS_SLOTS:
+        cr[name] = c[name] + r * q * m
     return cr, task < n, tc // (nv * NVCH), (tc // NVCH) % nv, tc % NVCH
+
+
+def token_lds(cr, t):
+    """Token slot t of a verify task's round LDS."""
+    ct = dict(cr)
+    for name, m in LDS_SLOTS:
+        ct[name] = cr[name] + t * m
+    return ct
 
 
 def _sel(vals, i):
@@ -386,10 +410,12 @@ def gdn_tasks_batched(c, tasks, ks):
         + ba_specs(c, tr, hr, parts)
     )
     qks = got[:rounds]
-    ba = ba_sums(c, tr, hr, parts, got[rounds:])
+    bv, av = ba_sums(c, tr, hr, parts, got[rounds:])
     if (tid >= 2 * HD) & (tid < 2 * HD + rounds):
         a = c["args"]
-        decay, beta = decay_beta(*ba, ld_bf(a["dt_bias"], hr), ld_f32(a["a_log"], hr))
+        decay, beta = decay_beta(
+            bv, av, ld_bf(a["dt_bias"], hr), ld_f32(a["a_log"], hr)
+        )
         fx.ptr_store(decay, c["scal"] + r * 4)
         fx.ptr_store(beta, c["scal"] + r * 4 + 1)
     gpu.barrier()
@@ -433,11 +459,15 @@ def gdn_tasks(c, rounds):
     only on earlier phases of other CTAs' tasks, and every CTA finishes a
     phase's work before it waits in the next."""
     tasks = [gdn_round(c, r) for r in range(rounds)]
-    ks = [gdn_stage(cr, t, h, ch) for cr, _, t, h, ch in tasks]
-    if const_expr(rounds >= BATCH_ROUNDS):
-        gdn_tasks_batched(c, tasks, ks)
+    if const_expr(c["q"] > 1):
+        ks = [verify_stage(cr, n, h, ch) for cr, _, n, h, ch in tasks]
+        _verify_phases(tasks, ks)
     else:
-        _gdn_phases(tasks, ks)
+        ks = [gdn_stage(cr, t, h, ch) for cr, _, t, h, ch in tasks]
+        if const_expr(rounds >= BATCH_ROUNDS):
+            gdn_tasks_batched(c, tasks, ks)
+        else:
+            _gdn_phases(tasks, ks)
 
 
 @traced
@@ -452,6 +482,146 @@ def _gdn_phases(tasks, ks):
         for (cr, live, t, h, ch), k in zip(tasks, ks):
             if live:
                 phase(cr, k, t, h, ch)
+
+
+# ---------------------------------------------------------------- gdn verify
+# An MTP verify step: request n's q = num_speculative_tokens + 1 rows are
+# n q .. n q + q - 1. As vLLM's spec-decode GDN core (``causal_conv1d_update``
+# with num_accepted_tokens, ``fused_gdn_decode_post_conv_mtp``): the conv
+# reads the request's slot st_idx[n, 0] from entry accepted - 1 and leaves
+# [history 2.., the q rows] there; the recurrence starts from slot
+# st_idx[n, accepted - 1] and stores the state after row t to st_idx[n, t]
+# (none where <= 0); a request whose start slot is <= 0 (a graph's pad) gets
+# zero core rows and writes no state.
+
+
+def verify_stage(c, n, h, ch):
+    """``gdn_stage`` of a verify task (request n): the slots, the conv window
+    from the accepted offset, the start state rows."""
+    tid, q = c["tid"], c["q"]
+    a, g = c["args"], c["gdn"]
+    k = {}
+    row = n * a["si_row"]
+    acc = uniform(ld_i32(a["n_acc"], n))
+    off = fx.min(fx.max(acc - 1, 0), q - 1)
+    src = uniform(ld_i32(a["st_idx"], row + off))
+    k["slot"] = ((acc > 0) & (acc <= q)).select(src, fx.Int32(0))
+    k["dst"] = [uniform(ld_i32(a["st_idx"], row + t)) for t in range(q)]
+    kh = h // (g.nv // g.nk)
+    k["owner"] = (h % (g.nv // g.nk)) == 0
+    ct = fx.min(tid, 3 * VCH - 1)
+    part = ct // VCH
+    i = ct % VCH
+    qk_chan = part * (g.nk * HD) + kh * HD + ch * VCH + i
+    v_chan = 2 * g.nk * HD + h * HD + ch * VCH + i
+    chan = (part < 2).select(qk_chan, v_chan)
+    k["part"], k["i"], k["chan"] = part, i, chan
+    cslot = k["dst"][0]
+    k["cslot"] = cslot
+    cs = a["conv_st"] + fx.Int64(fx.max(cslot, 0)) * fx.Int64(a["cs_seq"]) * 2
+    co = chan * a["cs_dim"]
+    k["cs"], k["co"] = cs, co
+    k["win"] = [ld_bf(cs, co + (off + j) * a["cs_tok"]) for j in range(SL)]
+    cw = fx.Vector(
+        bo.buffer_load(rsrc(a["conv_w"]), chan * 2, vec_width=2, dtype=T.i32)
+    )
+    k["cw"] = [bf_lo(cw[0]), bf_hi(cw[0]), bf_lo(cw[1]), bf_hi(cw[1])]
+    vr = ch * VCH + tid // 32
+    k["head_off"] = (h * HD + vr) * HD + (tid % 32) * 4
+    sbase = a["rstate"] + fx.Int64(fx.max(k["slot"], 0)) * fx.Int64(a["rs_seq"]) * 4
+    k["st"] = fx.Vector(
+        bo.buffer_load(rsrc(sbase), k["head_off"], vec_width=4, dtype=T.f32)
+    )
+    k["a_log"] = ld_f32(a["a_log"], h)
+    k["dtb"] = ld_bf(a["dt_bias"], h)
+    return k
+
+
+@traced
+def verify_conv(c, k, n, h, ch):
+    """The owned channels' conv over the request's q rows (window: the conv
+    state from the accepted offset, then the rows), the conv state left as
+    [window 1, window 2, the q rows]; q / k out through QK, v to the token
+    slots' LDS."""
+    tid, q = c["tid"], c["q"]
+    a, g = c["args"], c["gdn"]
+    part, owner = k["part"], k["owner"]
+    if tid < 3 * VCH:
+        got = c["poll"](
+            [(c["proj"], (n * q + t) * g.proj + k["chan"], 1) for t in range(q)]
+        )
+        w = k["win"] + [f32_of(got[t][0]) for t in range(q)]
+        owned = (part == 2) | owner
+        if (k["cslot"] > 0) & owned:
+            rs = rsrc(k["cs"])
+            for j in range_constexpr(SL + q - 1):
+                bo.buffer_store(
+                    fx.Float32(w[j + 1]).to(fx.BFloat16), rs, k["co"] + j * a["cs_tok"]
+                )
+        cw = k["cw"]
+        kh = h // (g.nv // g.nk)
+        for t in range_constexpr(q):
+            acc = bf16_round(cw[0] * w[t]) + bf16_round(cw[1] * w[t + 1])
+            acc = acc + bf16_round(cw[2] * w[t + 2])
+            acc = acc + bf16_round(cw[3] * w[t + 3])
+            o = bf16_round(silu(acc))
+            if (part < 2) & owner:
+                at = (((n * q + t) * g.nk + kh) * 2 + part) * HD + ch * VCH + k["i"]
+                c["put"](c["qk"], at, o)
+            if part == 2:
+                fx.ptr_store(o, c["vloc"] + (t * VCH + k["i"]))
+    gpu.barrier()
+
+
+@traced
+def verify_recur(c, k, n, h, ch):
+    """The request's q rows in order on state rows 16 ch .. of head h, the
+    state in registers from the start slot; the state after row t stored to
+    slot st_idx[n, t]; each row's o -> its slot's ``ol``, sums of squares ->
+    ONRM."""
+    tid, lane, q = c["tid"], c["lane"], c["q"]
+    a = c["args"]
+    live = k["slot"] > 0
+    st = [live.select(k["st"][e], fx.Float32(0.0)) for e in range(4)]
+    for t in range_constexpr(q):
+        ct = token_lds(c, t)
+        st, o = _delta_rule(ct, st, live)
+        dst = k["dst"][t]
+        if live & (dst > 0):
+            bo.buffer_store(
+                fx.Vector.from_elements(st, fx.Float32),
+                rsrc(a["rstate"] + fx.Int64(dst) * fx.Int64(a["rs_seq"]) * 4),
+                k["head_off"],
+            )
+        if lane % 32 == 0:
+            fx.ptr_store(o, ct["ol"] + tid // 32)
+    gpu.barrier()
+    if tid < q:
+        r = fx.min(tid, q - 1)
+        ss = fx.Float32(0.0)
+        for e in range_constexpr(VCH):
+            x = fx.ptr_load(c["ol"] + (r * VCH + e))
+            ss = ss + x * x
+        c["put"](c["onrm"], ((n * q + r) * c["gdn"].nv + h) * NVCH + ch, ss)
+    gpu.barrier()
+
+
+@traced
+def _verify_phases(tasks, ks):
+    for (cr, live, n, h, ch), k in zip(tasks, ks):
+        if live:
+            verify_conv(cr, k, n, h, ch)
+    for (cr, live, n, h, ch), k in zip(tasks, ks):
+        if live:
+            for t in range_constexpr(cr["q"]):
+                gdn_gates(token_lds(cr, t), k, n * cr["q"] + t, h)
+    for (cr, live, n, h, ch), k in zip(tasks, ks):
+        if live:
+            verify_recur(cr, k, n, h, ch)
+    for (cr, live, n, h, ch), k in zip(tasks, ks):
+        if live:
+            for t in range_constexpr(cr["q"]):
+                gdn_norm(token_lds(cr, t), k, n * cr["q"] + t, h, ch)
 
 
 # ---------------------------------------------------------------- kernel
