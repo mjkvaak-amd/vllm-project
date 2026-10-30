@@ -46,4 +46,9 @@ def _verify_reason(m, width: int, q: int) -> str | None:
         or m.num_spec_decodes * q != width
     ):
         return "not uniform"
+    idx, acc = m.spec_state_indices_tensor, m.num_accepted_tokens
+    if idx.dtype != torch.int32 or idx.stride(-1) != 1:
+        return "no int32 spec state indices"
+    if acc is None or acc.dtype != torch.int32 or acc.numel() < m.num_spec_decodes:
+        return "no int32 accepted-token counts"
     return None

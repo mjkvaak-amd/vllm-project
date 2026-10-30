@@ -124,11 +124,6 @@ def unsupported(vllm_config) -> list[str]:
             spec is not None and spec.uses_dynamic_speculative_decoding(),
             "dynamic speculative decoding",
         ),
-        # a verify step's GDN layers run vLLM's GDN core on AITER's Triton path
-        (
-            spec is not None and not gdn_aiter_triton_available(),
-            "MTP without AITER's Triton GDN kernels",
-        ),
         # the GDN block reads and writes one state slot a request in place
         (
             cc.mamba_cache_mode != "none",
@@ -184,14 +179,6 @@ def unsupported(vllm_config) -> list[str]:
     if layers > L.MAX_LAYERS:
         reasons.append(f"{layers} decoder layers (at most {L.MAX_LAYERS})")
     return reasons + platform_reasons()
-
-
-def gdn_aiter_triton_available() -> bool:
-    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        GDN_AITER_TRITON_AVAILABLE,
-    )
-
-    return GDN_AITER_TRITON_AVAILABLE
 
 
 def text_shapes(text) -> tuple:

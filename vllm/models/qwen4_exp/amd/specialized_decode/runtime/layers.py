@@ -93,14 +93,20 @@ class Launcher:
         )
         return x, inj
 
-    def gdn(self, layer, md, x) -> torch.Tensor:
-        """``linear_attn`` up to out_proj's input -> core [S, CORE]."""
+    def gdn(self, layer, md, x, q: int = 1) -> torch.Tensor:
+        """``linear_attn`` up to out_proj's input -> core [S, CORE]; ``q`` > 1
+        an MTP verify step of whole requests of ``q`` rows."""
         a = layer.linear_attn
+        m = md[a.prefix]
         conv_state, rstate = gdn_conv_state(a)
         s = x.size(0)
         core = x.new_empty(s, L.Layout(self.tp).CORE)
+        if q > 1:
+            st_idx, n_acc = m.spec_state_indices_tensor, m.num_accepted_tokens
+        else:
+            st_idx, n_acc = m.non_spec_state_indices_tensor, None
         blocks.gdn_block(
-            self.gdn_key(layer, s),
+            self.gdn_key(layer, s, q),
             x=x,
             w_qkvz=a.in_proj_qkvz.weight,
             w_qkvzs=a.in_proj_qkvz.weight_scale,
@@ -111,7 +117,8 @@ class Launcher:
             dt_bias=a.dt_bias,
             norm_w=a.norm.weight,
             rstate=rstate,
-            st_idx=md[a.prefix].non_spec_state_indices_tensor,
+            st_idx=st_idx,
+            n_acc=n_acc,
             core=core,
             scratch=self.attn_scratch[s],
             epoch=self.epoch,
@@ -181,13 +188,14 @@ class Launcher:
             tokens=s, tp=self.tp, self_msq=self_msq, eps=hc.config.rms_norm_eps
         )
 
-    def gdn_key(self, layer, s: int) -> blocks.GdnBuild:
+    def gdn_key(self, layer, s: int, q: int = 1) -> blocks.GdnBuild:
         a = layer.linear_attn
         return blocks.GdnBuild(
             tokens=s,
             tp=self.tp,
             norm_eps=a.norm.eps,
             shuffled=bool(mxfp4_shuffled(a.in_proj_qkvz)),
+            q=q,
         )
 
     def oproj_key(self, layer, s: int) -> blocks.OprojBuild:
@@ -206,47 +214,6 @@ def _block_out(state):
     s = state.size(0)
     msq = torch.empty(blocks.NRED, s, L.HC, dtype=torch.float32, device=state.device)
     return torch.empty_like(state), msq
-
-
-def gdn_verify_core(a, x) -> torch.Tensor:
-    """``QwenGatedDeltaNetAttention.forward_hip`` up to out_proj's input on an
-    MTP verify step (vLLM's GDN core applies the spec-decode metadata: each
-    draft's state slot, the accepted-token offsets) -> core [S, NV HD]. With
-    the fused spec-decode GDN kernel the core reads the packed projections and
-    applies the gated norm itself, as ``forward_cuda`` does; otherwise the
-    gated norm is ``RMSNormGated``'s Triton kernel, one launch."""
-    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        _encode_layer_name,
-    )
-
-    n = x.size(0)
-    qkvz, _ = a.in_proj_qkvz(x)
-    ba, _ = a.in_proj_ba(x)
-    heads = a.num_v_heads // a.tp_size
-    if (
-        a.enable_fused_gdn_spec_decode
-        and x.dtype == torch.bfloat16
-        and a.norm.weight.dtype in (torch.bfloat16, torch.float32)
-    ):
-        core = x.new_zeros(n, heads, a.head_v_dim)
-        torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
-            qkvz.view(n, -1),
-            ba.view(n, -1),
-            core,
-            layer_name=_encode_layer_name(a.prefix),
-        )
-        return core.view(n, -1)
-    core = x.new_empty(n, heads, a.head_v_dim)
-    z = torch.empty_like(core)
-    torch.ops.vllm.qwen_gdn_attention_core(
-        qkvz.view(n, -1),
-        ba.view(n, -1),
-        z,
-        core,
-        layer_name=_encode_layer_name(a.prefix),
-        use_aiter=True,
-    )
-    return a.norm.forward_cuda(core, z).reshape(n, -1)
 
 
 def qsa_core(attn, x, positions) -> tuple[torch.Tensor, torch.Tensor]:

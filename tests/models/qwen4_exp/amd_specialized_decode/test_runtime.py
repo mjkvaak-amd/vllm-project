@@ -84,7 +84,6 @@ def _spec_config(method="mtp", tokens=3, adaptive=False, dynamic=False):
 def supported_platform(monkeypatch):
     monkeypatch.setenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "1")
     monkeypatch.setattr(runtime, "platform_reasons", lambda: [])
-    monkeypatch.setattr(runtime, "gdn_aiter_triton_available", lambda: True)
 
 
 def test_off_without_monokernel():
@@ -110,7 +109,7 @@ def test_mtp_config(supported_platform, tokens, widths):
     assert got.widths == widths
 
 
-def test_mtp_refusals(supported_platform, monkeypatch):
+def test_mtp_refusals(supported_platform):
     def reasons(**spec):
         config = _vllm_config()
         config.speculative_config = _spec_config(**spec)
@@ -127,8 +126,6 @@ def test_mtp_refusals(supported_platform, monkeypatch):
     for why, spec in cases.items():
         got = reasons(**spec)
         assert got == [why], (why, got)
-    monkeypatch.setattr(runtime, "gdn_aiter_triton_available", lambda: False)
-    assert reasons() == ["MTP without AITER's Triton GDN kernels"]
 
 
 def test_refusals_report_every_reason(supported_platform, monkeypatch):
@@ -263,13 +260,18 @@ def test_step_reason(md, width, why):
     assert step_reason(md, "gdn", width) == why
 
 
-def _verify_metadata(reqs=2, q=4, uniform=True, decodes=0, prefills=0):
+def _verify_metadata(
+    reqs=2, q=4, uniform=True, decodes=0, prefills=0, idx=None, acc=torch.int32
+):
     return SimpleNamespace(
         num_prefills=prefills,
         num_decodes=decodes,
         num_spec_decodes=reqs,
         spec_sequence_masks=torch.ones(reqs, dtype=torch.bool) if reqs else None,
-        spec_state_indices_tensor=torch.zeros(reqs, q, dtype=torch.int32),
+        spec_state_indices_tensor=(
+            torch.zeros(reqs, q, dtype=torch.int32) if idx is None else idx
+        ),
+        num_accepted_tokens=None if acc is None else torch.ones(reqs, dtype=acc),
         uniform_spec_sequence_length=q if uniform else None,
     )
 
@@ -286,48 +288,37 @@ def _verify_metadata(reqs=2, q=4, uniform=True, decodes=0, prefills=0):
         ({"gdn": _verify_metadata(2, uniform=False)}, 8, "not uniform"),
         ({"gdn": _verify_metadata(2, q=3)}, 6, "not uniform"),
         ({"gdn": _verify_metadata(2)}, 12, "not uniform"),
+        # the block table's first q columns: rows strided
+        (
+            {
+                "gdn": _verify_metadata(
+                    2, idx=torch.zeros(2, 9, dtype=torch.int32)[:, :4]
+                )
+            },
+            8,
+            None,
+        ),
+        (
+            {"gdn": _verify_metadata(2, idx=torch.zeros(2, 4, dtype=torch.int64))},
+            8,
+            "no int32 spec state indices",
+        ),
+        (
+            {
+                "gdn": _verify_metadata(
+                    2, idx=torch.zeros(2, 8, dtype=torch.int32)[:, ::2]
+                )
+            },
+            8,
+            "no int32 spec state indices",
+        ),
+        ({"gdn": _verify_metadata(2, acc=None)}, 8, "no int32 accepted-token counts"),
+        (
+            {"gdn": _verify_metadata(2, acc=torch.int64)},
+            8,
+            "no int32 accepted-token counts",
+        ),
     ],
 )
 def test_verify_step_reason(md, width, why):
     assert step_reason(md, "gdn", width, q=4) == why
-
-
-@pytest.mark.parametrize("fused", [True, False])
-def test_gdn_verify_core_uses_fused_spec_decode(monkeypatch, fused):
-    import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn  # noqa: F401
-    from vllm.models.qwen4_exp.amd.specialized_decode.runtime.layers import (
-        gdn_verify_core,
-    )
-
-    n, heads, hd = 8, 4, 16
-    calls = []
-
-    def fused_core(qkvz, ba, core, layer_name):
-        calls.append("fused")
-        core.fill_(1)
-
-    def core_op(qkvz, ba, z, core, layer_name, use_aiter):
-        calls.append("core")
-        core.fill_(2)
-
-    monkeypatch.setattr(
-        torch.ops.vllm, "qwen_gdn_attention_core_fused_norm_packed", fused_core
-    )
-    monkeypatch.setattr(torch.ops.vllm, "qwen_gdn_attention_core", core_op)
-    layer = SimpleNamespace(
-        in_proj_qkvz=lambda x: (x.new_zeros(n, 3 * heads * hd), None),
-        in_proj_ba=lambda x: (x.new_zeros(n, 2 * heads), None),
-        num_v_heads=heads,
-        tp_size=1,
-        head_v_dim=hd,
-        prefix="model.layers.0.linear_attn",
-        enable_fused_gdn_spec_decode=fused,
-        norm=SimpleNamespace(
-            weight=torch.ones(hd, dtype=torch.bfloat16),
-            forward_cuda=lambda core, z: core,
-        ),
-    )
-    core = gdn_verify_core(layer, torch.zeros(n, 32, dtype=torch.bfloat16))
-    assert calls == ["fused" if fused else "core"]
-    assert core.shape == (n, heads * hd)
-    assert bool((core == (1 if fused else 2)).all())

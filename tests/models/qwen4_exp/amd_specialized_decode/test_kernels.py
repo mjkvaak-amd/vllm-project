@@ -9,7 +9,8 @@ checkpoint's formats at TP2 shapes, every width the decode runs (1 .. 16).
   state, from the previous block's sums of squares or its own.
 - The GDN block (one GPU): in_proj_qkvz (online MXFP4) / in_proj_ba -> AITER's
   conv update and fused gated delta rule -> RMSNormGated, the states it leaves
-  behind, pad rows.
+  behind, pad rows; on an MTP verify step against vLLM's spec-decode GDN core
+  (the accepted offsets, a state slot a draft).
 - The o_proj and MoE blocks (two GPUs): out_proj (MXFP4) / o_proj (bf16, the
   output gate), the sparse MoE block (softmax top-10, the MXFP4 experts, the
   fused shared expert), each + the all-reduce + the HC combine into the
@@ -33,6 +34,8 @@ from tests.models.qwen4_exp.amd_specialized_decode.reference import (
     _cos,
     _gdn_inputs,
     _gdn_reference,
+    _gdn_verify_core_ref,
+    _gdn_verify_inputs,
     _hc_weights,
     _mix_ref,
     _moe_emulation,
@@ -175,6 +178,82 @@ def test_gdn_block_matches_vllm_ops(s: int, n_real: int, shuffled: bool) -> None
     assert torch.equal(core[n_real:], torch.zeros_like(core[n_real:]))
     torch.testing.assert_close(rstate[0], w["rstate"][0], atol=0, rtol=0)
     torch.testing.assert_close(conv_state[0], w["conv_state"][0], atol=0, rtol=0)
+
+
+# (s, real requests) of q = 4 (MTP-3): one to four requests, a graph's pad
+@pytest.mark.parametrize("s,reqs", [(4, 1), (8, 1), (12, 3), (16, 4), (16, 3)])
+@pytest.mark.parametrize("shuffled", [True, False])
+@torch.inference_mode()
+def test_gdn_verify_block_matches_vllm_ops(s: int, reqs: int, shuffled: bool) -> None:
+    """The GDN block on an MTP verify step against in_proj -> vLLM's spec-decode
+    conv update -> ``fused_gdn_decode_post_conv_mtp`` (each request from its
+    last accepted draft's state, a state stored after every draft): the core,
+    the conv states and every draft's state slot; pad requests write nothing
+    and get zero core rows."""
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import Layout
+
+    q = 4
+    lay = Layout(TP)
+    w = _gdn_verify_inputs(s, q, reqs, shuffled=shuffled)
+    x, _, _ = _mix_ref(w["state"], w)
+    qkvz = F.linear(_mxfp4_qdq(x, shuffled).to(bf), w["w_qkvz_ref"])
+    ba = F.linear(x, w["w_ba"])
+    want_conv, want_rstate, want_core = _gdn_verify_core_ref(
+        w, qkvz, ba, lay.NK, lay.NV, q
+    )
+    key = blocks.GdnBuild(tokens=s, tp=TP, shuffled=shuffled, q=q)
+    conv_state, rstate = w["conv_state"].clone(), w["rstate"].clone()
+    core = torch.full((s, lay.CORE), float("nan"), dtype=bf, device="cuda")
+    scratch = torch.zeros(
+        blocks.scratch_bytes(blocks.gdn_scratch_layout(key)),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    hl = _health()
+    blocks.gdn_block(
+        key,
+        x=x.contiguous(),
+        w_qkvz=w["w_qkvz"],
+        w_qkvzs=w["w_qkvzs"],
+        w_ba=w["w_ba"],
+        conv_w=w["conv_w"],
+        conv_state=conv_state,
+        a_log=w["a_log"],
+        dt_bias=w["dt_bias"],
+        norm_w=w["norm_w"],
+        rstate=rstate,
+        st_idx=w["spec_idx"],
+        n_acc=w["n_acc"],
+        core=core,
+        scratch=scratch,
+        epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+        **hl,
+        layer=0,
+    )
+    torch.accelerator.synchronize()
+    assert not hl["health"].any()
+    rows = reqs * q
+    conv_live = w["spec_idx"][:reqs, 0].long()
+    state_live = w["spec_idx"][:reqs].reshape(-1).long()
+    errs = {
+        "conv_state": _rel_l2(conv_state[conv_live], want_conv[conv_live]),
+        "rstate": _rel_l2(rstate[state_live], want_rstate[state_live]),
+        "core": _rel_l2(core[:rows], want_core[:rows]),
+    }
+    assert errs["conv_state"] < 5e-3 and errs["rstate"] < 5e-3, errs
+    assert _cos(core[:rows], want_core[:rows]) > COS_MIN, errs
+    assert torch.equal(core[rows:], torch.zeros_like(core[rows:]))
+    untouched = torch.ones(rstate.size(0), dtype=torch.bool, device="cuda")
+    untouched[state_live] = False
+    torch.testing.assert_close(
+        rstate[untouched], w["rstate"][untouched], atol=0, rtol=0
+    )
+    untouched[:] = True
+    untouched[conv_live] = False
+    torch.testing.assert_close(
+        conv_state[untouched], w["conv_state"][untouched], atol=0, rtol=0
+    )
 
 
 def _tp_state(rank: int, tp_size: int, device) -> dict:
