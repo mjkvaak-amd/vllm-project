@@ -93,6 +93,28 @@ class Launcher:
         )
         return x, inj
 
+    def final_mix(self, mixer, w_down, state, msq) -> torch.Tensor:
+        """A final mixer's ``mix(state)`` -> its hidden states [S, H] on the HC
+        front. ``w_down``: its down projection with zero injection rows."""
+        s = state.size(0)
+        x = state.new_empty(s, L.HIDDEN)
+        front.hc_front(
+            self.front_key(mixer, s, msq is None),
+            state=state,
+            msq_in=msq,
+            hc_w=mixer.hc_norm.weight,
+            w_down=w_down,
+            w_up=mixer.input_mix_weight_up.weight,
+            inj_out=state.new_empty(s, L.HC),
+            bin_out=x,
+            scratch=self.attn_scratch[s],
+            epoch=self.epoch,
+            health=self.health,
+            alarm=self.alarm,
+            layer=blocks.HC_SLOT + L.MAX_LAYERS - 1,
+        )
+        return x
+
     def gdn(self, layer, md, x, q: int = 1) -> torch.Tensor:
         """``linear_attn`` up to out_proj's input -> core [S, CORE]; ``q`` > 1
         an MTP verify step of whole requests of ``q`` rows."""

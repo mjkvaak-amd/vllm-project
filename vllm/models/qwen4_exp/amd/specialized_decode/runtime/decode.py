@@ -115,6 +115,13 @@ def _zeros(key) -> list[int]:
     return [0] * len(abi.names)
 
 
+def _padded_down(mixer) -> torch.Tensor:
+    """A final mixer's down projection [LORA, 4 H] as the HC front's
+    [down; inject] rows, the injection rows zero."""
+    w = mixer.input_mix_weight_down.weight
+    return torch.cat([w, w.new_zeros(L.DOWN_ROWS - w.size(0), w.size(1))])
+
+
 class SpecializedDecode:
     """The executor over one ``Qwen4ExpModel``: builds the launch state,
     binds it to each KV cache and plans and runs every decode step."""
@@ -133,6 +140,9 @@ class SpecializedDecode:
             config.widths, tp.world_size, tp.rank_in_group, tp.cpu_group, dev
         )
         self.drafts = self._adopt_drafts(tp)
+        mixers = [model.hyper_connection_mixer]
+        mixers += [d.model.hyper_connection_mixer for d in self.drafts]
+        self.mix_down = {m: _padded_down(m) for m in mixers}
         builds = self._builds()
         for build, key in builds:
             compile_build(build, key)
@@ -162,6 +172,7 @@ class SpecializedDecode:
         from vllm.models.qwen4_exp.amd.specialized_decode.runtime.peer import tp_agree
 
         drafts = []
+        self.draft_fc: dict[torch.nn.Module, tuple[torch.Tensor, torch.Tensor]] = {}
         for draft in take_drafts():
             reasons = draft_reasons(draft.model, tp.world_size)
             if not tp_agree(not reasons, tp.cpu_group):
@@ -173,6 +184,12 @@ class SpecializedDecode:
                 continue
             draft.specialized_decode = self
             drafts.append(draft)
+            # Full input projections on every rank: one kernel, no all-gathers.
+            p = draft.model
+            self.draft_fc[p] = (
+                tp.all_gather(p.fc_embedding.weight, 0),
+                tp.all_gather(p.fc_hidden.weight, 0),
+            )
         return drafts
 
     def _builds(self) -> list:
@@ -183,6 +200,9 @@ class SpecializedDecode:
         draft_layers = [ly for d in self.drafts for ly in d.model.layers]
         for s in self.config.widths:
             keys.add((blocks.build_moe, blocks.MoeBuild(tokens=s, tp=la.tp)))
+            for mixer in self.mix_down:
+                for m in (False, True):
+                    keys.add((front.build, la.front_key(mixer, s, m)))
             for layer in draft_layers:
                 for hc in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
                     for m in (False, True):
@@ -305,8 +325,8 @@ class SpecializedDecode:
             state, msq = la.moe(layer, x, state, inj)
         if model._mtp_hidden_buffer is not None:
             model._mtp_hidden_buffer[: state.size(0)].copy_(state)
-        _, h, _ = model.hyper_connection_mixer.mix(state)
-        return h
+        mixer = model.hyper_connection_mixer
+        return la.final_mix(mixer, self.mix_down[mixer], state, msq)
 
     def plan_draft(
         self, input_ids, hidden_states, intermediate_tensors, inputs_embeds
@@ -336,22 +356,23 @@ class SpecializedDecode:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``Qwen4ExpMultiTokenPredictor.forward`` of a planned pass -> (the
         final mixer's hidden states [S, H], the state before it [S, HC H]):
-        vLLM's input projections, then the layer on the kernels as in ``run``.
-        The input norms run as one kernel each: outside the compiled predictor
-        ``GemmaRMSNorm`` is about eight."""
-        from vllm.models.qwen4_exp.amd.ops.hc import grouped_gemma_rmsnorm
-
-        def norm(module, x):
-            return grouped_gemma_rmsnorm(x, module.weight, module.variance_epsilon, 1)
+        the input norms, projections and embedding residual in one aiter
+        kernel over the full projections, then the layer on the kernels as in
+        ``run``."""
+        from vllm._aiter_ops import rocm_aiter_ops
 
         p, la = predictor, self.launch
         la.epoch.add_(1)
-        n = input_ids.size(0)
-        emb = p.fc_embedding(
-            norm(p.pre_fc_norm_embedding, p.embed_input_ids(input_ids))
+        w_e, w_h = self.draft_fc[p]
+        state = rocm_aiter_ops.mtp_residual_linear_shared(
+            p.embed_input_ids(input_ids),
+            hidden_states,
+            p.pre_fc_norm_embedding.weight,
+            p.pre_fc_norm_hidden.weight,
+            w_e,
+            w_h,
+            p.pre_fc_norm_embedding.variance_epsilon,
         )
-        h = norm(p.pre_fc_norm_hidden, hidden_states).view(n, L.HC, L.HIDDEN)
-        state = (emb.unsqueeze(-2) + p.fc_hidden(h)).flatten(-2)
         layer = p.layers[spec_step_idx % p.num_mtp_layers]
         x, inj = la.hc_front(
             layer, layer.attn_hyper_connection, state, None, la.attn_scratch
@@ -361,9 +382,9 @@ class SpecializedDecode:
         x, inj = la.hc_front(
             layer, layer.mlp_hyper_connection, state, msq, la.mlp_scratch
         )
-        state, _ = la.moe(layer, x, state, inj)
-        _, out, _ = p.hyper_connection_mixer.mix(state)
-        return out, state
+        state, msq = la.moe(layer, x, state, inj)
+        mixer = p.hyper_connection_mixer
+        return la.final_mix(mixer, self.mix_down[mixer], state, msq), state
 
     def after_step(self) -> None:
         """Once per executed step, from compute_logits (eager on every rank,

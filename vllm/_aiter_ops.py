@@ -2723,6 +2723,26 @@ class rocm_aiter_ops:
         )
 
     @staticmethod
+    def mtp_residual_linear_shared(
+        e: torch.Tensor,
+        h: torch.Tensor,
+        e_norm_weight: torch.Tensor,
+        h_norm_weight: torch.Tensor,
+        w_e: torch.Tensor,
+        w_h: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """gemma_rmsnorm(h)[c] @ w_h.T + gemma_rmsnorm(e) @ w_e.T for each of
+        the C streams of h [T, C * K], as [T, C * N]."""
+        from aiter.ops.triton.gemm.fused.fused_gemm_mtp_residual_linear_shared import (  # noqa: E501
+            fused_gemm_mtp_residual_linear_shared,
+        )
+
+        return fused_gemm_mtp_residual_linear_shared(
+            e, h, e_norm_weight, h_norm_weight, w_e, w_h, eps
+        )
+
+    @staticmethod
     def argmax_pair_pick(pairs: torch.Tensor) -> torch.Tensor:
         """int64 index of the largest (value, index) pair in each row of
         an FP32 (M, 2 * T) tensor."""

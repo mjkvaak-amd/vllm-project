@@ -163,9 +163,7 @@ def model_reasons(model, tp: int) -> list[str]:
     reasons = []
     if model.start_layer != 0 or model.end_layer != len(model.layers):
         reasons.append("partial layers")
-    mixer = model.hyper_connection_mixer
-    if mixer is None or mixer.use_combine:
-        reasons.append("no final HC mixer")
+    reasons += _mixer_reasons(model.hyper_connection_mixer)
     if not any(ly.layer_type == "linear_attention" for ly in model.layers):
         reasons.append("no GDN layer")
     lay = L.Layout(tp)
@@ -177,15 +175,35 @@ def model_reasons(model, tp: int) -> list[str]:
     return reasons
 
 
+def _mixer_reasons(mixer) -> list[str]:
+    """Why the HC front cannot run this final mixer."""
+    if mixer is None or mixer.use_combine:
+        return ["no final HC mixer"]
+    if (
+        mixer.hc_norm.weight.shape != (L.HH,)
+        or mixer.input_mix_weight_down.weight.shape != (L.LORA, L.HH)
+        or mixer.input_mix_weight_up.weight.shape != (L.HH, L.LORA)
+    ):
+        return ["a final HC mixer of other shapes"]
+    return []
+
+
 def draft_reasons(predictor, tp: int) -> list[str]:
     """Every reason the kernels cannot serve the loaded MTP drafter
     (``Qwen4ExpMultiTokenPredictor``) layers."""
     reasons = []
     if predictor.use_hc_sequence_parallel:
         reasons.append("HC sequence parallelism")
-    mixer = predictor.hyper_connection_mixer
-    if mixer is None or mixer.use_combine:
-        reasons.append("no final HC mixer")
+    reasons += _mixer_reasons(predictor.hyper_connection_mixer)
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    for fc in (predictor.fc_embedding, predictor.fc_hidden):
+        if (
+            not isinstance(fc.quant_method, UnquantizedLinearMethod)
+            or fc.weight.dtype != torch.bfloat16
+            or fc.bias is not None
+        ):
+            reasons.append(f"{fc.prefix} is not a BF16 projection without bias")
     lay = L.Layout(tp)
     for layer in predictor.layers:
         why = _layer_reasons(layer, lay)
