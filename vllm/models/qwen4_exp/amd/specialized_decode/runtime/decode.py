@@ -336,12 +336,21 @@ class SpecializedDecode:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``Qwen4ExpMultiTokenPredictor.forward`` of a planned pass -> (the
         final mixer's hidden states [S, H], the state before it [S, HC H]):
-        vLLM's input projections, then the layer on the kernels as in ``run``."""
+        vLLM's input projections, then the layer on the kernels as in ``run``.
+        The input norms run as one kernel each: outside the compiled predictor
+        ``GemmaRMSNorm`` is about eight."""
+        from vllm.models.qwen4_exp.amd.ops.hc import grouped_gemma_rmsnorm
+
+        def norm(module, x):
+            return grouped_gemma_rmsnorm(x, module.weight, module.variance_epsilon, 1)
+
         p, la = predictor, self.launch
         la.epoch.add_(1)
         n = input_ids.size(0)
-        emb = p.fc_embedding(p.pre_fc_norm_embedding(p.embed_input_ids(input_ids)))
-        h = p.pre_fc_norm_hidden(hidden_states).view(n, L.HC, L.HIDDEN)
+        emb = p.fc_embedding(
+            norm(p.pre_fc_norm_embedding, p.embed_input_ids(input_ids))
+        )
+        h = norm(p.pre_fc_norm_hidden, hidden_states).view(n, L.HC, L.HIDDEN)
         state = (emb.unsqueeze(-2) + p.fc_hidden(h)).flatten(-2)
         layer = p.layers[spec_step_idx % p.num_mtp_layers]
         x, inj = la.hc_front(
