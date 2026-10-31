@@ -12,7 +12,7 @@ shared by the generic cache-layout planner.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from typing import ClassVar
 
@@ -594,12 +594,18 @@ class QSAForwardMetadata(AttentionMetadata):
     max_seq_len: int
     storage_block_size: int
     compress_ratio: int
+    # The build's inputs, views of persistent buffers: a draft decode step
+    # refreshes the metadata above from them in place.
+    common_attn_metadata: CommonAttentionMetadata | None = field(
+        default=None, repr=False
+    )
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_draft_decode_metadata_update = HAS_TRITON
 
     def __init__(
         self,
@@ -676,31 +682,15 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             if nonzero_query_lens.numel() > 0:
                 decode_query_len = int(nonzero_query_lens[0].item())
                 assert torch.all(nonzero_query_lens == decode_query_len)
-        build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
         k_work_metadata = self.k_work_metadata_buffer
-        request_capacity = None
-        if build_k_work:
+        if self._builds_k_work:
             num_requests = common_attn_metadata.query_start_loc.shape[0] - 1
-            request_capacity = self.request_capacity
             max_num_work = (
                 num_tokens + (self.compress_ratio - 1) * num_requests
             ) // self.compress_ratio
             k_work_metadata = self.k_work_metadata_buffer[:max_num_work]
         token_to_req, logical_positions, visible_blocks, slot_mapping = (
-            build_qsa_metadata(
-                common_attn_metadata,
-                self.token_to_req_buffer,
-                self.logical_positions_buffer,
-                self.visible_blocks_buffer,
-                self.slot_mapping_buffer,
-                storage_block_size=self.storage_block_size,
-                compress_ratio=self.compress_ratio,
-                circular_buffer_size=(
-                    self.kv_cache_spec.block_size if self.is_circular_buffer else 0
-                ),
-                k_work_metadata_buffer=k_work_metadata if build_k_work else None,
-                request_capacity=request_capacity,
-            )
+            self._build_side_metadata(common_attn_metadata, k_work_metadata)
         )
         return QSAForwardMetadata(
             block_table=common_attn_metadata.block_table_tensor,
@@ -721,6 +711,38 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            common_attn_metadata=common_attn_metadata,
+        )
+
+    @property
+    def _builds_k_work(self) -> bool:
+        return not self.is_circular_buffer and self.compress_ratio != 1
+
+    def _build_side_metadata(
+        self, common_attn_metadata: CommonAttentionMetadata, k_work_metadata
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        build_k_work = self._builds_k_work
+        return build_qsa_metadata(
+            common_attn_metadata,
+            self.token_to_req_buffer,
+            self.logical_positions_buffer,
+            self.visible_blocks_buffer,
+            self.slot_mapping_buffer,
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
+            circular_buffer_size=(
+                self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+            ),
+            k_work_metadata_buffer=k_work_metadata if build_k_work else None,
+            request_capacity=self.request_capacity if build_k_work else None,
+        )
+
+    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
+        # One Triton launch over the build's device inputs, into the buffers
+        # the metadata already references.
+        assert metadata.common_attn_metadata is not None
+        self._build_side_metadata(
+            metadata.common_attn_metadata, metadata.k_work_metadata
         )
 
 

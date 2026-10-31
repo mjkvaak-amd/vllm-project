@@ -505,6 +505,67 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
     assert metadata.k_work_metadata.tolist() == [[0, 0], [2, 0], [2, 1], [-1, -1]]
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAS_TRITON, reason="needs a GPU and Triton"
+)
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_qsa_draft_decode_metadata_update_matches_a_fresh_build(
+    compress_ratio: int,
+) -> None:
+    """A draft decode step advances seq_lens and the slot mapping in place;
+    the in-place refresh must give the metadata a fresh build gives."""
+    device = torch.device("cuda")
+
+    def make_builder():
+        builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
+        builder.compress_ratio = compress_ratio
+        builder.reorder_batch_threshold = 1
+        builder.is_circular_buffer = False
+        builder.storage_block_size = 16
+        builder.request_capacity = 8
+        builder.token_to_req_buffer = torch.empty(8, dtype=torch.int32, device=device)
+        builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64, device=device)
+        builder.logical_positions_buffer = torch.empty(
+            8, dtype=torch.int64, device=device
+        )
+        builder.visible_blocks_buffer = torch.empty(8, dtype=torch.int32, device=device)
+        builder.k_work_metadata_buffer = torch.empty(
+            8, 2, dtype=torch.int32, device=device
+        )
+        return builder
+
+    query_start_loc = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([7, 30, 12, 50], dtype=torch.int32, device=device)
+    block_table = torch.arange(16, dtype=torch.int32, device=device).view(4, 4)
+    slot_mapping = (block_table[:, 0].long() * 16 + seq_lens - 1).contiguous()
+    common = SimpleNamespace(
+        num_actual_tokens=4,
+        num_reqs=4,
+        max_query_len=1,
+        max_seq_len=64,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=seq_lens,
+        slot_mapping=slot_mapping,
+        block_table_tensor=block_table,
+        token_to_req_indices=lambda buffer: buffer[:4].copy_(
+            torch.arange(4, dtype=torch.int32, device=device)
+        ),
+    )
+    builder = make_builder()
+    metadata = builder.build(0, common)
+    for _ in range(3):
+        seq_lens += 1
+        slot_mapping += 1
+        builder.update_draft_decode_metadata(metadata)
+        fresh = make_builder().build(0, common)
+        for name in ("token_to_req", "logical_positions", "visible_blocks"):
+            assert torch.equal(getattr(metadata, name), getattr(fresh, name)), name
+        assert torch.equal(metadata.slot_mapping, fresh.slot_mapping)
+        if compress_ratio != 1:
+            assert torch.equal(metadata.k_work_metadata, fresh.k_work_metadata)
+
+
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
 def test_qsa_unfused_cache_update_ignores_padded_qk() -> None:

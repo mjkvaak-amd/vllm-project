@@ -350,7 +350,12 @@ class DraftModelSpeculator(BaseSpeculator):
             }
         )
         self.supports_decode_metadata_update = not unsupported_backends
-        if unsupported_backends:
+        if not unsupported_backends:
+            logger.info_once(
+                "All draft attention backends update draft decode metadata in "
+                "place; the draft steps run as one fused multi-step decode."
+            )
+        else:
             logger.info_once(
                 "Attention backend(s) %s cannot update draft decode metadata in "
                 "place; falling back to rebuilding attention metadata eagerly.",
