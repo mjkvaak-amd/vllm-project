@@ -177,6 +177,26 @@ def model_reasons(model, tp: int) -> list[str]:
     return reasons
 
 
+def draft_reasons(predictor, tp: int) -> list[str]:
+    """Every reason the kernels cannot serve the loaded MTP drafter
+    (``Qwen4ExpMultiTokenPredictor``) layers."""
+    reasons = []
+    if predictor.use_hc_sequence_parallel:
+        reasons.append("HC sequence parallelism")
+    mixer = predictor.hyper_connection_mixer
+    if mixer is None or mixer.use_combine:
+        reasons.append("no final HC mixer")
+    lay = L.Layout(tp)
+    for layer in predictor.layers:
+        why = _layer_reasons(layer, lay)
+        if layer.layer_idx >= L.MAX_LAYERS:
+            why.append(f"layer index {layer.layer_idx}")
+        if layer.ple is not None:
+            why.append("a PLE layer")
+        reasons += [f"{w} (layer {layer.layer_idx})" for w in why]
+    return reasons
+
+
 def cache_reasons(model, tp: int, q: int = 1) -> list[str]:
     """Every reason the kernels cannot update the GDN states vLLM bound (with
     MTP, ``q`` > 1, the conv state also keeps the drafts' entries)."""

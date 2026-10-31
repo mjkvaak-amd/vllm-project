@@ -8,6 +8,7 @@ and ``run_specialized_decode`` in ``forward`` (and in the multimodal wrapper's
 in ``compute_logits``. The model state (``Qwen4ExpModelState``) builds the
 executor after load."""
 
+import weakref
 from typing import TYPE_CHECKING
 
 import torch
@@ -23,6 +24,23 @@ if TYPE_CHECKING:
         SpecializedDecode,
         Step,
     )
+
+
+# The MTP drafters built in this process: the drafter loads before the model
+# state builds the executor, which takes them over (``take_drafts``).
+_DRAFTS: list = []
+
+
+def register_draft(model) -> None:
+    """``Qwen4ExpMTP.__init__`` with ``--monokernel``: the executor runs the
+    drafter's layers on the kernels if they pass its checks."""
+    _DRAFTS.append(weakref.ref(model))
+
+
+def take_drafts() -> list:
+    drafts = [d for d in (ref() for ref in _DRAFTS) if d is not None]
+    _DRAFTS.clear()
+    return drafts
 
 
 class SpecializedDecodeMixin:

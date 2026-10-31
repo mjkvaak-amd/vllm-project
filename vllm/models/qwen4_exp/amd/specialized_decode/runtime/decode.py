@@ -53,6 +53,7 @@ from vllm.models.qwen4_exp.amd.specialized_decode.runtime import NAME, DecodeCon
 from vllm.models.qwen4_exp.amd.specialized_decode.runtime.guards import (
     FailStop,
     cache_reasons,
+    draft_reasons,
     model_reasons,
 )
 from vllm.models.qwen4_exp.amd.specialized_decode.runtime.layers import (
@@ -131,6 +132,7 @@ class SpecializedDecode:
         self.launch = Launcher(
             config.widths, tp.world_size, tp.rank_in_group, tp.cpu_group, dev
         )
+        self.drafts = self._adopt_drafts(tp)
         builds = self._builds()
         for build, key in builds:
             compile_build(build, key)
@@ -142,23 +144,50 @@ class SpecializedDecode:
         )
         self._kv: tuple[int, int] | None = None
         logger.info(
-            "%s: %d layers, widths %d-%d step %d, %d builds; other steps run "
-            "vLLM's decode",
+            "%s: %d layers (+%d MTP drafter), widths %d-%d step %d, %d builds; "
+            "other steps run vLLM's decode",
             NAME,
             len(model.layers),
+            sum(len(d.model.layers) for d in self.drafts),
             config.widths[0],
             config.widths[-1],
             config.q,
             len(builds),
         )
 
+    def _adopt_drafts(self, tp) -> list:
+        """The MTP drafters built in this process whose layers the kernels
+        serve on every TP rank; each then plans its draft passes here."""
+        from vllm.models.qwen4_exp.amd.specialized_decode.hooks import take_drafts
+        from vllm.models.qwen4_exp.amd.specialized_decode.runtime.peer import tp_agree
+
+        drafts = []
+        for draft in take_drafts():
+            reasons = draft_reasons(draft.model, tp.world_size)
+            if not tp_agree(not reasons, tp.cpu_group):
+                logger.warning(
+                    "%s: the MTP drafter runs vLLM's forward: %s",
+                    NAME,
+                    "; ".join(reasons) or "another TP rank refused",
+                )
+                continue
+            draft.specialized_decode = self
+            drafts.append(draft)
+        return drafts
+
     def _builds(self) -> list:
         from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks, front
 
         la = self.launch
         keys: set[tuple[Callable[[Any], Any], Any]] = set()
+        draft_layers = [ly for d in self.drafts for ly in d.model.layers]
         for s in self.config.widths:
             keys.add((blocks.build_moe, blocks.MoeBuild(tokens=s, tp=la.tp)))
+            for layer in draft_layers:
+                for hc in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
+                    for m in (False, True):
+                        keys.add((front.build, la.front_key(hc, s, m)))
+                keys.add((blocks.build_oproj, la.oproj_key(layer, s)))
             for layer in self.model.layers:
                 for hc in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
                     for m in (False, True):
@@ -278,6 +307,54 @@ class SpecializedDecode:
             model._mtp_hidden_buffer[: state.size(0)].copy_(state)
         _, h, _ = model.hyper_connection_mixer.mix(state)
         return h
+
+    def plan_draft(
+        self, input_ids, hidden_states, intermediate_tensors, inputs_embeds
+    ) -> bool:
+        """Whether an adopted drafter's pass runs on the kernels: a text pass
+        of a width the launches serve once a KV cache is bound, outside
+        PIECEWISE graphs (as ``plan``)."""
+        if (
+            intermediate_tensors is not None
+            or inputs_embeds is not None
+            or input_ids is None
+            or hidden_states is None
+            or self._kv is None
+        ):
+            return False
+        if not is_forward_context_available() or in_piecewise_cudagraph():
+            return False
+        if input_ids.size(0) not in self.config.widths:
+            return False
+        logger.info_once(
+            "%s: first specialized draft pass (%d rows)", NAME, input_ids.size(0)
+        )
+        return True
+
+    def run_draft(
+        self, predictor, input_ids, positions, hidden_states, spec_step_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``Qwen4ExpMultiTokenPredictor.forward`` of a planned pass -> (the
+        final mixer's hidden states [S, H], the state before it [S, HC H]):
+        vLLM's input projections, then the layer on the kernels as in ``run``."""
+        p, la = predictor, self.launch
+        la.epoch.add_(1)
+        n = input_ids.size(0)
+        emb = p.fc_embedding(p.pre_fc_norm_embedding(p.embed_input_ids(input_ids)))
+        h = p.pre_fc_norm_hidden(hidden_states).view(n, L.HC, L.HIDDEN)
+        state = (emb.unsqueeze(-2) + p.fc_hidden(h)).flatten(-2)
+        layer = p.layers[spec_step_idx % p.num_mtp_layers]
+        x, inj = la.hc_front(
+            layer, layer.attn_hyper_connection, state, None, la.attn_scratch
+        )
+        core, gate = qsa_core(layer.self_attn, x, positions)
+        state, msq = la.oproj(layer, core, gate, state, inj)
+        x, inj = la.hc_front(
+            layer, layer.mlp_hyper_connection, state, msq, la.mlp_scratch
+        )
+        state, _ = la.moe(layer, x, state, inj)
+        _, out, _ = p.hyper_connection_mixer.mix(state)
+        return out, state
 
     def after_step(self) -> None:
         """Once per executed step, from compute_logits (eager on every rank,

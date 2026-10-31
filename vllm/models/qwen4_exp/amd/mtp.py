@@ -390,15 +390,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=mapper)
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-        "hidden_states": 0,
-    }
-)
 class Qwen4ExpMTP(
     LocalArgmaxMixin, nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts
 ):
@@ -444,6 +435,12 @@ class Qwen4ExpMTP(
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        # set by the target's specialized decode when it takes this drafter over
+        self.specialized_decode = None
+        if vllm_config.kernel_config.monokernel:
+            from .specialized_decode.hooks import register_draft
+
+            register_draft(self)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -457,6 +454,13 @@ class Qwen4ExpMTP(
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        decode = self.specialized_decode
+        if decode is not None and decode.plan_draft(
+            input_ids, hidden_states, intermediate_tensors, inputs_embeds
+        ):
+            return decode.run_draft(
+                self.model, input_ids, positions, hidden_states, spec_step_idx
+            )
         return self.model(
             input_ids,
             positions,
