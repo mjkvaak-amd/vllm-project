@@ -289,6 +289,11 @@ class LogitsProcessor(PluggableLayer):
             weight_scale = None
         else:
             return None
+        logger.info_once(
+            "Fused the lm_head GEMM and the local argmax in one aiter kernel "
+            "(%s weight).",
+            weight.dtype,
+        )
         shard = lm_head.shard_indices
         return rocm_aiter_ops.gemm_argmax(
             hidden_states,
