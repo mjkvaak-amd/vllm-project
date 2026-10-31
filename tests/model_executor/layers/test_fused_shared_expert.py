@@ -1212,6 +1212,30 @@ def test_online_targeting_only_one_shared_projection_rejects_fse() -> None:
     )
 
 
+@pytest.mark.parametrize("online_routed", [False, True])
+def test_online_routed_targets_fuse_unquantized_shared_expert(
+    online_routed: bool,
+) -> None:
+    """A BF16 MTP layer beside an MXFP4 target: online quantization of its
+    routed experts quantizes the shared expert fused into them too."""
+    layer = "mtp.layers.48"
+    shared_prefix = f"{layer}.mlp.shared_expert"
+    quant_config = QuarkConfig({**_QUARK_FSE_CONFIG, "exclude": [f"re:{layer}.*"]})
+    quant_config.online_quantization_config = OnlineQuantizationConfig(
+        QuantizationConfigArgs(
+            targets={"mtp.*.experts" if online_routed else "*.out_proj": "mxfp4"}
+        )
+    )
+
+    assert is_shared_expert_quant_fse_compatible(
+        quant_config, f"{layer}.mlp.experts", shared_prefix
+    ) == (
+        (True, None)
+        if online_routed
+        else (False, f"Quark excludes shared experts at {shared_prefix}")
+    )
+
+
 def test_online_fp8_shared_expert_rejects_quark_mxfp4_fse() -> None:
     shared_prefix = "model.layers.0.mlp.shared_expert"
     quant_config = QuarkConfig({**_QUARK_FSE_CONFIG, "exclude": []})

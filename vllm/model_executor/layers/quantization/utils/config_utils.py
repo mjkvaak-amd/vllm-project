@@ -279,6 +279,25 @@ def is_shared_expert_quant_fse_compatible(
             for projection_name in projection_names
         )
         if is_excluded:
+            from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+            # Both expert sets unquantized in the checkpoint (e.g. a BF16 MTP
+            # layer next to an MXFP4 target) and online quantization targeting
+            # only the routed experts: the shared expert loads unquantized into
+            # the routed experts' weights and is quantized with them.
+            if (
+                shared_expert_targets is None
+                and online_quant_config is not None
+                and online_quant_config.resolve_quant_method_cls(
+                    RoutedExperts, expert_prefix
+                )
+                is not None
+            ):
+                routed_target = quant_config.get_quant_method_target(
+                    expert_prefix, RoutedExperts
+                )[0]
+                if routed_target is None:
+                    return True, None
             return False, f"Quark excludes shared experts at {shared_expert_prefix}"
 
         global_quant_config = quant_config.quant_config["global_quant_config"]
