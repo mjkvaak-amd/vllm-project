@@ -215,3 +215,61 @@ def test_layerwise_reload_of_drafter_keeps_copy(
     assert after.keys() == before.keys()
     for name, tensor in before.items():
         assert torch.equal(after[name], tensor), name
+
+
+@pytest.fixture
+def aiter_gemm_argmax(monkeypatch):
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER_GEMM_ARGMAX", "1")
+    rocm_aiter_ops.refresh_env_variables()
+    if not rocm_aiter_ops.is_gemm_argmax_enabled():
+        pytest.skip("The fused aiter GEMM and argmax needs gfx950.")
+    yield
+    monkeypatch.undo()
+    rocm_aiter_ops.refresh_env_variables()
+
+
+@pytest.mark.parametrize("quantization", [None, "fp8"])
+def test_fused_top_tokens_select_max_logit(
+    default_vllm_config, dist_init, monkeypatch, aiter_gemm_argmax, quantization
+):
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.model_executor.layers.quantization.online.lm_head import (
+        LMHeadFp8ArgmaxMethod,
+    )
+
+    calls = []
+    gemm_argmax = rocm_aiter_ops.gemm_argmax
+
+    def counted_gemm_argmax(*args, **kwargs):
+        calls.append(1)
+        return gemm_argmax(*args, **kwargs)
+
+    monkeypatch.setattr(rocm_aiter_ops, "gemm_argmax", counted_gemm_argmax)
+
+    head = _target_head(monkeypatch)
+    if quantization is not None:
+        head = quantized_lm_head_copy(head, quantization)
+        assert isinstance(head.quant_method, LMHeadFp8ArgmaxMethod)
+        weight = head.weight.float() * head.weight_scale[:, None]
+    else:
+        weight = head.weight.float()
+    logits_processor = LogitsProcessor(VOCAB)
+    for num_tokens in (1, 4, 16, 64):
+        hidden = torch.randn(num_tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        top = logits_processor.get_top_tokens(head, hidden)
+        logits = (hidden.float() @ weight[:VOCAB].T).to(torch.bfloat16).float()
+        assert top.dtype == torch.int64 and (top < VOCAB).all()
+        selected = logits.gather(1, top[:, None]).squeeze(1)
+        # Equal up to the rounding of one logit.
+        torch.testing.assert_close(
+            selected, logits.max(dim=-1).values, atol=0, rtol=2**-7
+        )
+    assert len(calls) == 4
+    # Full logits quantize the activations per token.
+    hidden = torch.randn(256, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    out = logits_processor(head, hidden).float()
+    ref = (hidden.float() @ weight[:VOCAB].T).float()
+    assert ((out - ref).norm() / ref.norm()).item() < 0.05

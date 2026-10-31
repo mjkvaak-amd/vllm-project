@@ -8,6 +8,7 @@ from functools import cache
 import torch
 import torch.nn.functional as F
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
@@ -217,6 +218,13 @@ class LogitsProcessor(PluggableLayer):
             )
         tp_size = lm_head.tp_size
 
+        pair = self._fused_local_argmax(lm_head, hidden_states, embedding_bias)
+        if pair is not None:
+            if tp_size == 1:
+                return pair[:, 1].to(torch.int64)
+            gathered = tensor_model_parallel_all_gather(pair, dim=-1)
+            return rocm_aiter_ops.argmax_pair_pick(gathered)
+
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         if self.soft_cap is not None:
             logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
@@ -249,6 +257,46 @@ class LogitsProcessor(PluggableLayer):
         max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
         top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
         return top_tokens.squeeze(-1).to(torch.int64)
+
+    def _fused_local_argmax(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """The (max, global index) pair of each row on this shard from the
+        fused aiter GEMM and argmax, or None where it does not apply. A
+        positive logit scale does not change the argmax."""
+        if (
+            embedding_bias is not None
+            or self.soft_cap is not None
+            or hidden_states.dtype not in (torch.float16, torch.bfloat16)
+            or self.head_dtype not in (None, hidden_states.dtype)
+            or not rocm_aiter_ops.is_gemm_argmax_enabled()
+        ):
+            return None
+        from vllm.model_executor.layers.quantization.online.lm_head import (
+            LMHeadFp8ArgmaxMethod,
+        )
+
+        method, weight = lm_head.quant_method, lm_head.weight
+        if isinstance(method, LMHeadFp8ArgmaxMethod):
+            weight_scale = lm_head.weight_scale
+        elif (
+            isinstance(method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod))
+            and weight.dtype == hidden_states.dtype
+        ):
+            weight_scale = None
+        else:
+            return None
+        shard = lm_head.shard_indices
+        return rocm_aiter_ops.gemm_argmax(
+            hidden_states,
+            weight,
+            weight_scale,
+            n_valid=weight.shape[0] - shard.num_org_vocab_padding,
+            index_offset=shard.org_vocab_start_index,
+        )
 
     def get_top_k_tokens(
         self,

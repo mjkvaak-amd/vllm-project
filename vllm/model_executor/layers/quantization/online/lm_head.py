@@ -9,12 +9,16 @@ from weakref import WeakKeyDictionary
 import torch
 from torch.nn import Module
 
+from vllm import _custom_ops as ops
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PtpcOnlineLinearMethod,
     OnlineLinearBase,
+    _fp8_channel_scale,
+    _fp8_quant_per_channel,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     FLOAT4_E2M1_MAX,
@@ -80,10 +84,41 @@ class _LMHeadNvfp4Method(OnlineLinearBase):
         return self.kernel.apply_weights(layer, x, bias)
 
 
+class LMHeadFp8ArgmaxMethod(OnlineLinearBase):
+    """FP8 lm_head copy with the per-row weight scales of the PTPC method,
+    kept in the plain (N, K) layout for the fused aiter GEMM and argmax.
+    Full logits quantize the activations per token, like the PTPC method."""
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        scale = _fp8_channel_scale(weight_amax(layer.weight, dim=-1, keepdim=True))
+        qweight = _fp8_quant_per_channel(layer.weight, scale)
+        replace_parameter(layer, "weight", qweight)
+        replace_parameter(layer, "weight_scale", scale.float().view(-1).contiguous())
+
+    def apply(
+        self, layer: Module, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        x_q, x_scale = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+        return torch._scaled_mm(
+            x_q,
+            layer.weight.t(),
+            scale_a=x_scale,
+            scale_b=layer.weight_scale.view(1, -1),
+            bias=bias,
+            out_dtype=x.dtype,
+        )
+
+
 _LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {
     "fp8": Fp8PtpcOnlineLinearMethod,
     "nvfp4": _LMHeadNvfp4Method,
 }
+
+
+def _lm_head_method(quantization: str) -> type[OnlineLinearBase]:
+    if quantization == "fp8" and rocm_aiter_ops.is_gemm_argmax_enabled():
+        return LMHeadFp8ArgmaxMethod
+    return _LM_HEAD_METHODS[quantization]
 
 
 def _quantize_copy(lm_head: ParallelLMHead, quantization: str) -> ParallelLMHead:
@@ -110,7 +145,7 @@ def _quantize_copy(lm_head: ParallelLMHead, quantization: str) -> ParallelLMHead
             padding_size=lm_head.padding_size,
             prefix=lm_head.prefix,
             disable_tp=lm_head.disable_tp,
-            quant_method=_LM_HEAD_METHODS[quantization](),
+            quant_method=_lm_head_method(quantization)(),
         )
     # Never loaded: a new param sharing the source storage, never a copy of it.
     head.weight = torch.nn.Parameter(lm_head.weight.data, requires_grad=False)

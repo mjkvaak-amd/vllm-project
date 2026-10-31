@@ -2200,6 +2200,8 @@ class rocm_aiter_ops:
         VLLM_ROCM_USE_AITER_MOE_SITUV2: SiTUv2 FlyDSL MoE activation
             dtype (a16w4 | a8w4 | a4w4).
         VLLM_ROCM_USE_AITER_TRITON_GEMM: Controls Triton unquantized GEMM.
+        VLLM_ROCM_USE_AITER_GEMM_ARGMAX: Controls the fused lm_head GEMM and
+            argmax of drafters (gfx950).
 
     Note:
         The environment variables are assigned when the module is imported,
@@ -2272,6 +2274,7 @@ class rocm_aiter_ops:
     _MOE_SITUV2 = _resolve_situv2_activation()
     # TODO: Consolidate under _LINEAR_ENABLED
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+    _GEMM_ARGMAX = envs.VLLM_ROCM_USE_AITER_GEMM_ARGMAX
     # Lazily probed: whether aiter.topk_softmax supports the
     # num_shared_experts / shared_expert_scoring_func args (7-arg form).
     _TOPK_SOFTMAX_FUSED_SIGMOID: bool | None = None
@@ -2301,6 +2304,7 @@ class rocm_aiter_ops:
         cls._MOE_SITUV2 = _resolve_situv2_activation()
         _sync_aiter_situv2_moe_env()
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+        cls._GEMM_ARGMAX = envs.VLLM_ROCM_USE_AITER_GEMM_ARGMAX
         cls._MOE_DISPATCH_POLICY = envs.VLLM_ROCM_AITER_MOE_DISPATCH_POLICY
 
     @staticmethod
@@ -2687,6 +2691,44 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_triton_gemm_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._TRITON_UNQUANT_GEMM
+
+    @classmethod
+    @if_aiter_supported
+    def is_gemm_argmax_enabled(cls) -> bool:
+        from vllm.platforms.rocm import on_gfx950
+
+        return cls._AITER_ENABLED and cls._GEMM_ARGMAX and on_gfx950()
+
+    @staticmethod
+    def gemm_argmax(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor | None,
+        n_valid: int,
+        index_offset: int,
+    ) -> torch.Tensor:
+        """(max, index + index_offset) of each row of x @ weight.T, as FP32
+        (M, 2). weight is 16-bit, or FP8 with one scale for each row."""
+        from aiter.ops.triton.gemm.fused.fused_gemm_argmax import (
+            fused_gemm_a16w8_argmax,
+            fused_gemm_a16w16_argmax,
+        )
+
+        if weight_scale is None:
+            return fused_gemm_a16w16_argmax(
+                x, weight, n_valid=n_valid, index_offset=index_offset
+            )
+        return fused_gemm_a16w8_argmax(
+            x, weight, weight_scale, n_valid=n_valid, index_offset=index_offset
+        )
+
+    @staticmethod
+    def argmax_pair_pick(pairs: torch.Tensor) -> torch.Tensor:
+        """int64 index of the largest (value, index) pair in each row of
+        an FP32 (M, 2 * T) tensor."""
+        from aiter.ops.triton.gemm.fused.fused_gemm_argmax import argmax_pair_pick
+
+        return argmax_pair_pick(pairs)
 
     @classmethod
     @if_aiter_supported
