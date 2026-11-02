@@ -16,6 +16,7 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
 
 _SAMPLING_EPS = 1e-5
 
@@ -303,7 +304,7 @@ class Sampler(nn.Module):
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
         if current_platform.is_cpu():
             return torch.ops._C.greedy_argmax(logits)
-        return logits.argmax(dim=-1).view(-1)
+        return greedy_argmax(logits).view(-1)
 
     def sample(
         self,

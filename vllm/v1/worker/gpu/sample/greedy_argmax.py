@@ -43,7 +43,7 @@ def greedy_argmax(logits: torch.Tensor) -> torch.Tensor:
     """
     if (
         not logits.is_cuda
-        or logits.dtype not in (torch.bfloat16, torch.float32)
+        or logits.dtype not in (torch.bfloat16, torch.float16, torch.float32)
         or logits.ndim != 2
         or logits.stride(1) != 1
         or logits.shape[1] < 4096

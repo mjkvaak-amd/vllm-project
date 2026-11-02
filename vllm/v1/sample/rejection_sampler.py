@@ -34,6 +34,7 @@ from vllm.v1.spec_decode.fly import (
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -508,7 +509,7 @@ def rejection_sample(
 
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
-        target_argmax = target_logits.argmax(dim=-1)
+        target_argmax = greedy_argmax(target_logits)
         if fly_enabled:
             assert fly_entropy is not None and fly_window_size is not None
             apply_fly_greedy_acceptance_kernel[(batch_size,)](

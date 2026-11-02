@@ -64,6 +64,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -442,9 +443,9 @@ class SpecDecodeBaseProposer:
             logits = self.model.compute_logits(hidden_states)
             assert self.vocab_mapping is not None
             logits = self.vocab_mapping.constrain_draft_logits(logits)
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = greedy_argmax(logits)
             return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+        return greedy_argmax(self.model.compute_logits(hidden_states))
 
     def _sample_from_logits(
         self,
@@ -452,9 +453,9 @@ class SpecDecodeBaseProposer:
         sampling_metadata: SamplingMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs:
-            return logits.argmax(dim=-1), None
+            return greedy_argmax(logits), None
         if sampling_metadata.all_greedy:
-            return logits.argmax(dim=-1), None
+            return greedy_argmax(logits), None
 
         # Parallel drafting (e.g. DFlash) samples num_speculative_tokens rows
         # per request in a single pass, so logits has batch_size * K rows while
@@ -1833,7 +1834,7 @@ def compute_probs_and_sample_next_token(
         # For greedy requests, draft_probs is not used in rejection sampling.
         # Therefore, we can just return the logits.
         probs = logits
-        next_token_ids = logits.argmax(dim=-1)
+        next_token_ids = greedy_argmax(logits)
         return next_token_ids, probs
 
     assert sampling_metadata.temperature is not None
@@ -1860,6 +1861,6 @@ def compute_probs_and_sample_next_token(
     # will be used later for rejection sampling.
     next_token_ids = sample_with_exponential_noise(probs.clone(), q)
     if not sampling_metadata.all_random:
-        greedy_token_ids = probs.argmax(dim=-1)
+        greedy_token_ids = greedy_argmax(probs)
         next_token_ids = torch.where(is_greedy, greedy_token_ids, next_token_ids)
     return next_token_ids, probs

@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
+from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -263,7 +264,7 @@ class Step3p5MTPProposer(EagleProposer):
             logits = self.model.compute_logits(
                 hidden_states, spec_step_idx=spec_step_idx
             )
-            return logits.argmax(dim=-1), None
+            return greedy_argmax(logits), None
 
         logits = self.model.compute_logits(hidden_states, spec_step_idx=spec_step_idx)
         return self._sample_from_logits(logits, sampling_metadata)
