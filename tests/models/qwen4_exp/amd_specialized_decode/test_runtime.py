@@ -12,6 +12,7 @@ from vllm.config import CompilationMode, CUDAGraphMode
 from vllm.models.qwen4_exp.amd.specialized_decode import runtime
 from vllm.models.qwen4_exp.amd.specialized_decode.mono import layout as L
 from vllm.models.qwen4_exp.amd.specialized_decode.runtime.routing import step_reason
+from vllm.models.qwen4_exp.amd.specialized_decode.wide import layout as W
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -21,7 +22,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _text_config(**over):
-    values = dict(zip(L.SHAPE_NAMES, L.SHAPES))
+    values = dict(zip(L.SHAPE_NAMES, L.SHAPES)) | dict(zip(W.SHAPE_NAMES, W.SHAPES))
     values.update(norm_topk_prob=True, num_hidden_layers=40)
     values.update(over)
     return SimpleNamespace(**values)
@@ -51,7 +52,9 @@ def _vllm_config(monokernel=True, **parallel):
             cache_dtype="auto",
         ),
         compilation_config=SimpleNamespace(
-            mode=CompilationMode.VLLM_COMPILE, cudagraph_mode=CUDAGraphMode.FULL
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL,
+            cudagraph_capture_sizes=[1, 2, 4, 8, 12, 16, 24, 32, 40, 136, 256],
         ),
         lora_config=None,
         kv_transfer_config=None,
@@ -85,8 +88,10 @@ def test_off_without_monokernel():
 
 def test_supported_config(supported_platform):
     config = runtime.specialized_decode_config(_vllm_config())
-    assert config == runtime.DecodeConfig()
-    assert config.widths == tuple(range(1, 17))
+    # the wide kernels take the capture sizes above the mono widths, up to
+    # 128 rows in multiples of 8
+    assert config == runtime.DecodeConfig(wide_widths=(16, 24, 32, 40))
+    assert config.widths == (*range(1, runtime.MONO_MAX_TOKENS + 1), 16, 24, 32, 40)
 
 
 def test_refusals_report_every_reason(supported_platform, monkeypatch):
@@ -114,7 +119,7 @@ def test_refusals_report_every_reason(supported_platform, monkeypatch):
         "the V1 model runner",
         "model shapes (4096,",
         "router weights without top-k renormalization",
-        "80 decoder layers (at most 64)",
+        "80 decoder layers (at most 48)",
         "without --monokernel, vLLM's decode runs",
     ):
         assert why in msg, (why, msg)

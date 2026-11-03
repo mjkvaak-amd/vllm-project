@@ -6,31 +6,52 @@
 ``specialized_decode_config`` runs in the model's ``__init__``, before the
 weights load. It returns None for the stock decode, and raises with every
 reason from ``unsupported`` when ``--monokernel`` is set for a deployment the
-kernels cannot serve. Checks that need the loaded model run when the executor
-is built (``decode.SpecializedDecode``), those that need the GDN states at
-every KV cache bind (``decode.SpecializedDecode.bind_caches``)."""
+kernels cannot serve (default-deny). Checks that need the loaded model run when
+the executor is built (``decode.SpecializedDecode``), those that need the GDN
+states at every KV cache bind (``decode.SpecializedDecode.bind_caches``)."""
 
 from dataclasses import dataclass
 
 from vllm.logger import init_logger
 from vllm.models.qwen4_exp.amd.specialized_decode.mono import layout as L
+from vllm.models.qwen4_exp.amd.specialized_decode.wide import layout as W
 
 logger = init_logger(__name__)
 
 TP = 2
 NAME = "Qwen3.8-Flash-Next specialized decode (--monokernel)"
+# the widest step the mono kernels serve; wider steps go to the wide kernels.
+# At TP2 on MI355X the mono kernels are ahead up to 8 rows and the wide ones
+# from 12 (median ITL, 1K and 8K inputs)
+MONO_MAX_TOKENS = 8
 
 
 @dataclass(frozen=True)
 class DecodeConfig:
-    # rows a launch serves; a wider step runs vLLM's decode
-    max_tokens: int = L.MAX_TOKENS
+    """``mono_widths``: every row count up to MONO_MAX_TOKENS (eager steps and
+    FULL graph capture sizes alike; a graph's pad rows are inert).
+    ``wide_widths``: the deployment's CUDA graph capture sizes above that, up to
+    the wide kernels' MAX_TOKENS, in multiples of 8. A step of another width
+    runs vLLM's decode."""
+
+    wide_widths: tuple[int, ...] = ()
+    mono_widths: tuple[int, ...] = tuple(range(1, MONO_MAX_TOKENS + 1))
 
     @property
     def widths(self) -> tuple[int, ...]:
-        """Every row count up to ``max_tokens``: eager steps and FULL graph
-        capture sizes alike (a graph's pad rows are inert in the kernels)."""
-        return tuple(range(1, self.max_tokens + 1))
+        return self.mono_widths + self.wide_widths
+
+
+def decode_widths(vllm_config) -> tuple[int, ...]:
+    """The capture sizes the wide kernels serve."""
+    sizes = vllm_config.compilation_config.cudagraph_capture_sizes or ()
+    return tuple(
+        sorted(
+            s
+            for s in set(sizes)
+            if MONO_MAX_TOKENS < s <= W.MAX_TOKENS and s % W.MIN_TOKENS == 0
+        )
+    )
 
 
 def specialized_decode_config(vllm_config) -> DecodeConfig | None:
@@ -51,7 +72,7 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
             "use FULL decode graphs",
             NAME,
         )
-    return DecodeConfig()
+    return DecodeConfig(wide_widths=decode_widths(vllm_config))
 
 
 def unsupported(vllm_config) -> list[str]:
@@ -84,7 +105,7 @@ def unsupported(vllm_config) -> list[str]:
         (pc.prefill_context_parallel_size != 1, "prefill context parallelism"),
         # the kernels read one batch's attention metadata per step
         (pc.use_ubatching, "DBO (dual-batch overlap)"),
-        # the blocks take and return every token row on every rank
+        # the kernels take and return every token row on every rank
         (
             is_hc_sequence_parallel_enabled(vllm_config),
             "sequence parallelism (HC or MoE)",
@@ -102,9 +123,9 @@ def unsupported(vllm_config) -> list[str]:
             "CPU weight offload",
         ),
         (vllm_config.weight_transfer_config is not None, "weight updates"),
-        # the GDN block runs plain decode rows, one token a request
+        # the GDN kernels run plain decode rows, one token a request
         (vllm_config.speculative_config is not None, "speculative decoding"),
-        # the GDN block reads and writes one state slot a request in place
+        # the GDN kernels read and write one state slot a request in place
         (
             cc.mamba_cache_mode != "none",
             (
@@ -126,7 +147,7 @@ def unsupported(vllm_config) -> list[str]:
             cc.cache_dtype not in ("auto", "bfloat16"),
             f"QSA KV cache dtype {cc.cache_dtype!r} (BF16 only)",
         ),
-        # the MoE block runs the shared expert as routed expert 512
+        # the MoE kernels run the shared expert as routed expert 512
         (
             not envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS,
             (
@@ -147,22 +168,29 @@ def unsupported(vllm_config) -> list[str]:
         ),
     )
     reasons = [why for bad, why in checks if bad]
-    shapes = text_shapes(mc.hf_text_config)
-    if shapes != L.SHAPES:
-        reasons.append(
-            f"model shapes {shapes} ({', '.join(L.SHAPE_NAMES)}; "
-            f"Qwen3.8-Flash-Next is {L.SHAPES})"
-        )
-    if not getattr(mc.hf_text_config, "norm_topk_prob", True):
+    text = mc.hf_text_config
+    for names, want in ((L.SHAPE_NAMES, L.SHAPES), (W.SHAPE_NAMES, W.SHAPES)):
+        shapes = text_shapes(text, names)
+        if shapes != want:
+            reasons.append(
+                f"model shapes {shapes} ({', '.join(names)}; "
+                f"Qwen3.8-Flash-Next is {want})"
+            )
+    if not getattr(text, "norm_topk_prob", True):
         reasons.append("router weights without top-k renormalization")
-    layers = getattr(mc.hf_text_config, "num_hidden_layers", 0)
-    if layers > L.MAX_LAYERS:
-        reasons.append(f"{layers} decoder layers (at most {L.MAX_LAYERS})")
+    gate = getattr(text, "output_gate_type", "sigmoid")
+    if gate != "sigmoid":
+        reasons.append(f"GDN output gate {gate!r} (sigmoid only)")
+    layers = getattr(text, "num_hidden_layers", 0)
+    if layers > min(L.MAX_LAYERS, W.MAX_LAYERS):
+        reasons.append(
+            f"{layers} decoder layers (at most {min(L.MAX_LAYERS, W.MAX_LAYERS)})"
+        )
     return reasons + platform_reasons()
 
 
-def text_shapes(text) -> tuple:
-    return tuple(getattr(text, name, None) for name in L.SHAPE_NAMES)
+def text_shapes(text, names=L.SHAPE_NAMES) -> tuple:
+    return tuple(getattr(text, name, None) for name in names)
 
 
 def platform_reasons() -> list[str]:
