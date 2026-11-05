@@ -74,7 +74,9 @@ class FakeQSA:
     def flydsl_qsa_paged_gqa_supported(self, q, k_cache, v_cache, indices, page_table):
         return self.k2_reason
 
-    def flydsl_qsa_paged_gqa(self, q, k_cache, v_cache, indices, page_table, token_to_req, out):
+    def flydsl_qsa_paged_gqa(
+        self, q, k_cache, v_cache, indices, page_table, token_to_req, out
+    ):
         self.k2_calls.append(q.shape[0])
         out.fill_(1)
         return out
@@ -199,23 +201,19 @@ def test_select_trims_the_table_on_prefill_batches(
         return page_table
 
     monkeypatch.setattr(qsa_flydsl, "flydsl_select_paged_tokens", select)
-    indexer = SimpleNamespace(
-        use_flydsl=True,
-        compressed_key_cache=SimpleNamespace(kv_cache=None),
-        token_topk=TOKEN_TOPK,
-        compress_ratio=COMPRESS_RATIO,
-    )
+    indexer = _indexer(True)
     metadata = SimpleNamespace(
         block_table=torch.zeros(2, 168, dtype=torch.int32),
         token_to_req=None,
         logical_positions=None,
         seq_lens=None,
         num_prefills=num_prefills,
+        num_decode_tokens=1,
         max_seq_len=max_seq_len,
         storage_block_size=392,
         compress_ratio=COMPRESS_RATIO,
     )
-    QSAIndexer._select(indexer, None, metadata, None)
+    QSAIndexer._select(indexer, torch.zeros(2, 512), metadata, None)
     assert widths == [width]
 
 
@@ -232,26 +230,89 @@ def test_select_stays_on_triton_without_the_flydsl_backend(monkeypatch):
     monkeypatch.setattr(qsa_flydsl, "flydsl_select_paged_tokens", flydsl)
     monkeypatch.setattr(
         "vllm.models.qwen4_exp.amd.ops.qsa.qsa_select_paged_tokens",
-        lambda *args: sentinel,
+        lambda *args, **kwargs: sentinel,
     )
-    indexer = SimpleNamespace(
-        use_flydsl=False,
-        compressed_key_cache=SimpleNamespace(kv_cache=None),
-        token_topk=TOKEN_TOPK,
-        compress_ratio=COMPRESS_RATIO,
-    )
+    indexer = _indexer(False)
     metadata = SimpleNamespace(
         block_table=torch.zeros(2, 168, dtype=torch.int32),
         token_to_req=None,
         logical_positions=None,
         seq_lens=None,
         num_prefills=0,
+        num_decode_tokens=2,
         max_seq_len=3000,
         storage_block_size=392,
         compress_ratio=COMPRESS_RATIO,
     )
     assert QSAIndexer._select(indexer, None, metadata, None) is sentinel
     assert qsa_indexer  # the module imports without AITER
+
+
+def test_select_sends_long_prefill_chunks_to_the_mfma_scorer(monkeypatch):
+    """Under the flydsl backend a batch's prefill rows of at least
+    MFMA_SCORER_MIN_ROWS take the MFMA scorer and its decode rows stay on K1."""
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.amd.ops import qsa
+    from vllm.models.qwen4_exp.amd.ops.qsa_mfma_scorer import MFMA_SCORER_MIN_ROWS
+    from vllm.models.qwen4_exp.amd.qsa_indexer import QSAIndexer
+
+    calls = []
+
+    def k1(q, k_cache, page_table, token_to_req, positions, seq_lens, topk, r, out):
+        calls.append(("k1", q.shape[0], token_to_req[0].item()))
+        if out is not None:
+            out.fill_(1)
+        return page_table
+
+    def scorer(
+        q, k_cache, page_table, token_to_req, *args, num_decode_tokens=None, **kwargs
+    ):
+        calls.append(("mfma", q.shape[0], token_to_req[0].item(), num_decode_tokens))
+        args[-1].fill_(2)
+        return args[-1]
+
+    monkeypatch.setattr(qsa_flydsl, "flydsl_select_paged_tokens", k1)
+    monkeypatch.setattr(qsa, "qsa_select_paged_tokens", scorer)
+    decode, prefill = 3, MFMA_SCORER_MIN_ROWS
+    rows = decode + prefill
+    indexer = _indexer(True, torch.zeros(1, dtype=torch.bfloat16))
+    metadata = SimpleNamespace(
+        block_table=torch.zeros(4, 168, dtype=torch.int32),
+        token_to_req=torch.tensor([0, 1, 2] + [3] * prefill),
+        logical_positions=torch.arange(rows),
+        seq_lens=None,
+        num_prefills=1,
+        num_decode_tokens=decode,
+        max_seq_len=3000,
+        storage_block_size=392,
+        compress_ratio=COMPRESS_RATIO,
+    )
+    q = torch.zeros(rows, 512, dtype=torch.bfloat16)
+    out = QSAIndexer._select(indexer, q, metadata, None)
+    assert calls == [("mfma", prefill, 3, 0), ("k1", decode, 0)]
+    assert out[:decode].eq(1).all() and out[decode:].eq(2).all()
+
+    calls.clear()
+    metadata.token_to_req = torch.tensor([0, 1, 2] + [3] * (prefill - 1))
+    q = q[: rows - 1]
+    QSAIndexer._select(indexer, q, metadata, None)
+    assert calls == [("k1", rows - 1, 0)]
+
+
+def _indexer(use_flydsl, kv_cache=None):
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.amd.qsa_indexer import QSAIndexer
+
+    indexer = SimpleNamespace(
+        use_flydsl=use_flydsl,
+        compressed_key_cache=SimpleNamespace(kv_cache=kv_cache),
+        token_topk=TOKEN_TOPK,
+        compress_ratio=COMPRESS_RATIO,
+    )
+    indexer._select_flydsl = lambda *args: QSAIndexer._select_flydsl(indexer, *args)
+    return indexer
 
 
 def test_missing_aiter_raises(monkeypatch):

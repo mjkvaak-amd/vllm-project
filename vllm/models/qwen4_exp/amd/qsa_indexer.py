@@ -362,7 +362,6 @@ class QSAIndexer(nn.Module):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         from .ops.qsa import qsa_select_paged_tokens
-        from .ops.qsa_flydsl import flydsl_select_paged_tokens
 
         block_table = metadata.block_table
         if metadata.num_prefills:
@@ -372,19 +371,97 @@ class QSAIndexer(nn.Module):
             tokens_per_page = metadata.storage_block_size * metadata.compress_ratio
             block_table = block_table[:, : cdiv(metadata.max_seq_len, tokens_per_page)]
         if self.use_flydsl:
-            selected = flydsl_select_paged_tokens(
-                q,
-                self.compressed_key_cache.kv_cache,
+            return self._select_flydsl(q, metadata, block_table, out)
+        return qsa_select_paged_tokens(
+            q,
+            self.compressed_key_cache.kv_cache,
+            block_table,
+            metadata.token_to_req,
+            metadata.logical_positions,
+            metadata.seq_lens,
+            self.token_topk,
+            self.compress_ratio,
+            out,
+            max_seq_len=metadata.max_seq_len,
+            num_decode_tokens=metadata.num_decode_tokens,
+        )
+
+    def _select_flydsl(
+        self,
+        q: torch.Tensor,
+        metadata: QSAIndexerMetadata,
+        block_table: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """FlyDSL K1 for decode rows and short prefills; a batch's prefill rows
+        of at least ``MFMA_SCORER_MIN_ROWS`` go to the MFMA tile scorer, which
+        gathers each key tile once for 64 rows where K1 scores row by row."""
+        from .ops.qsa import qsa_select_paged_tokens
+        from .ops.qsa_flydsl import flydsl_select_paged_tokens
+        from .ops.qsa_mfma_scorer import mfma_scorer_applies
+
+        keys = self.compressed_key_cache.kv_cache
+        rows = q.shape[0]
+        split = metadata.num_decode_tokens if metadata.num_prefills else rows
+        if split < rows and mfma_scorer_applies(q[split:], keys):
+            if out is None:
+                width = self.token_topk + self.compress_ratio - 1
+                out = torch.empty((rows, width), dtype=torch.int32, device=q.device)
+            prefill = slice(split, rows)
+            qsa_select_paged_tokens(
+                q[prefill],
+                keys,
                 block_table,
-                metadata.token_to_req,
-                metadata.logical_positions,
+                metadata.token_to_req[prefill],
+                metadata.logical_positions[prefill],
                 metadata.seq_lens,
                 self.token_topk,
                 self.compress_ratio,
-                out,
+                out[prefill],
+                max_seq_len=metadata.max_seq_len,
+                num_decode_tokens=0,
             )
-            if selected is not None:
-                return selected
+            if not split:
+                return out
+            decode = slice(0, split)
+            selected = flydsl_select_paged_tokens(
+                q[decode],
+                keys,
+                block_table,
+                metadata.token_to_req[decode],
+                metadata.logical_positions[decode],
+                metadata.seq_lens,
+                self.token_topk,
+                self.compress_ratio,
+                out[decode],
+            )
+            if selected is None:
+                qsa_select_paged_tokens(
+                    q[decode],
+                    keys,
+                    block_table,
+                    metadata.token_to_req[decode],
+                    metadata.logical_positions[decode],
+                    metadata.seq_lens,
+                    self.token_topk,
+                    self.compress_ratio,
+                    out[decode],
+                    max_seq_len=metadata.max_seq_len,
+                )
+            return out
+        selected = flydsl_select_paged_tokens(
+            q,
+            keys,
+            block_table,
+            metadata.token_to_req,
+            metadata.logical_positions,
+            metadata.seq_lens,
+            self.token_topk,
+            self.compress_ratio,
+            out,
+        )
+        if selected is not None:
+            return selected
         return qsa_select_paged_tokens(
             q,
             self.compressed_key_cache.kv_cache,
