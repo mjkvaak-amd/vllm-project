@@ -19,7 +19,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.platforms.rocm import on_gfx950
+from vllm.platforms.rocm import get_cdna_version
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
@@ -1043,7 +1043,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             and alibi_slopes is None
             and sinks is None
             and not logits_soft_cap
-            and on_gfx950()
+            and get_cdna_version() in (3, 4)
             and not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
         )
         if self.use_fp8_extend_query:
@@ -1055,7 +1055,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             logger.info_once(
                 "AITER FA: use_prefill_query_quantization is not used for "
                 "layers with a sliding window, ALiBi, sinks or soft cap; it "
-                "needs gfx950 and an FP8 e4m3 KV cache in the default layout."
+                "needs gfx942 or gfx950 and an FP8 KV cache in the default layout."
             )
 
         if attn_type != AttentionType.DECODER:
