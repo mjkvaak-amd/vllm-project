@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
+    VLLM_ROCM_MESH_LEND_ALL_REDUCE: bool = False
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
     VLLM_ROCM_MUSE_SP_MIN_TOKENS: int = 1024
@@ -1341,6 +1342,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CudaCommunicator on ROCm. Also enables AITER AG/RS for DP communication.
     "VLLM_ROCM_USE_AITER_CUSTOM_AR": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_CUSTOM_AR", "True").lower() in ("true", "1")
+    ),
+    # Route prefill-sized TP2/TP4 all-reduces through AITER's mesh-lending
+    # all-reduce (gfx942 and gfx950, bare metal). Off by default: it borrows the SDMA
+    # engines and xGMI links of the GPUs outside the TP group, which other
+    # servers on the node may be using, and vLLM cannot see that.
+    "VLLM_ROCM_MESH_LEND_ALL_REDUCE": lambda: (
+        os.getenv("VLLM_ROCM_MESH_LEND_ALL_REDUCE", "False").lower() in ("true", "1")
     ),
     # Muse Spark on ROCm: dtype of the TP reduction before the post-expert norm.
     "VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE": lambda: os.getenv(

@@ -2393,6 +2393,7 @@ class rocm_aiter_ops:
     # Chunk length the AITER FlyDSL K5 prefill kernels are compiled for.
     GDN_FLYDSL_CHUNK_SIZE = 64
     _CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
+    _MESH_LEND_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_MESH_LEND_ALL_REDUCE
     _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
@@ -2429,6 +2430,7 @@ class rocm_aiter_ops:
         """
         cls._AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
         cls._CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
+        cls._MESH_LEND_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_MESH_LEND_ALL_REDUCE
         cls._LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
         cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
         cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
@@ -2665,6 +2667,27 @@ class rocm_aiter_ops:
         return QuickAllReduceInt4(
             group=group, device=device, rank=rank, world_size=world_size
         )
+
+    @classmethod
+    @if_aiter_supported
+    def is_mesh_lend_all_reduce_enabled(cls) -> bool:
+        """Whether the operator asked for AITER's mesh-lending all-reduce on
+        a platform it was measured on: gfx942 and gfx950 (CDNA 3 and 4)."""
+        from vllm.platforms.rocm import get_cdna_version
+
+        return (
+            cls._AITER_ENABLED
+            and cls._MESH_LEND_ALL_REDUCE_ENABLED
+            and get_cdna_version() in (3, 4)
+        )
+
+    @staticmethod
+    def create_mesh_lend_all_reduce(*, group: Any, device: Any, max_bytes: int) -> Any:
+        from aiter.dist.device_communicators.mesh_lend_all_reduce import (
+            MeshLendAllReduce,
+        )
+
+        return MeshLendAllReduce(group, device, max_bytes=max_bytes)
 
     @classmethod
     @if_aiter_supported

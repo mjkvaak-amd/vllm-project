@@ -61,6 +61,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_flashinfer_allreduce = False
             use_flashinfer_pcie_ipc_allreduce = False
             use_aiter_allreduce = False
+            use_mesh_lend_allreduce = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
@@ -80,6 +81,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 and not envs.VLLM_BATCH_INVARIANT
                 and bool(rocm_aiter_ops.is_custom_all_reduce_enabled())
             )
+            # Its handle exchange needs a torch.distributed-registered group.
+            use_mesh_lend_allreduce = (
+                use_custom_allreduce
+                and not envs.VLLM_BATCH_INVARIANT
+                and tcp_store_group is None
+                and bool(rocm_aiter_ops.is_mesh_lend_all_reduce_enabled())
+            )
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
@@ -96,6 +104,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
             FlashInferPcieIpcAllReduce,
+        )
+        from vllm.distributed.device_communicators.mesh_lend_all_reduce import (
+            MeshLendAllReduce,
         )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
@@ -118,6 +129,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+        self.mesh_lend_comm: MeshLendAllReduce | None = None
         self.use_aiter_ag_rs: bool = False
         self.use_aiter_tp_all_gather: bool = False
 
@@ -206,6 +218,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+        if use_mesh_lend_allreduce and self.world_size > 1:
+            self.mesh_lend_comm = MeshLendAllReduce(
+                group=self.cpu_group,
+                device=self.device,
+                world_size=self.world_size,
+                quantization=envs.VLLM_ROCM_QUICK_REDUCE_QUANTIZATION,
+            )
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -324,6 +344,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
+            "MESH_LEND",
             "QUICK_REDUCE",
             "AITER_CUSTOM",
             "CUSTOM",
@@ -362,6 +383,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and nccl_symm_ws_ok
         ):
             enabled_ar_backends.append("NCCL_SYMM_MEM")
+        if self.mesh_lend_comm is not None and not self.mesh_lend_comm.disabled:
+            enabled_ar_backends.append("MESH_LEND")
         if self.qr_comm is not None and not self.qr_comm.disabled:
             enabled_ar_backends.append("QUICK_REDUCE")
         if (
@@ -404,6 +427,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
+        mesh_lend_comm = self.mesh_lend_comm
+        if mesh_lend_comm is not None and mesh_lend_comm.should_use(input_):
+            return mesh_lend_comm.all_reduce(input_)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -870,6 +896,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.aiter_ar_comm is not None:
             self.aiter_ar_comm.close()
             self.aiter_ar_comm = None
+        if self.mesh_lend_comm is not None:
+            self.mesh_lend_comm.close()
+            self.mesh_lend_comm = None
         if self.fi_ar_comm is not None:
             self.fi_ar_comm.destroy()
             self.fi_ar_comm = None
