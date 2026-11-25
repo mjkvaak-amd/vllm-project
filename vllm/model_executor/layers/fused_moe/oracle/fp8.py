@@ -389,23 +389,28 @@ def resolve_fp8_moe_weight_block_shape(
     # not even be an FP8 one (the target's), must not choose its layout.
     if (
         is_checkpoint_fp8_serialized
-        and config.moe_backend != "auto"
         and Fp8MoEKernelOracle.maybe_skip_for_requantization_source() is None
     ):
-        kernel_classes = backend_to_kernel_cls(map_fp8_backend(config.moe_backend))
-        refined_key = (
-            None
-            if refined_shape is None
-            else create_fp8_quant_key(
-                static=True, group_shape=GroupShape(*refined_shape)
+        if config.moe_backend == "auto":
+            # Backend selection follows the weight key, so a refined shape
+            # selects a kernel that consumes it.
+            can_refine = refined_shape is not None
+        else:
+            kernel_classes = backend_to_kernel_cls(map_fp8_backend(config.moe_backend))
+            refined_key = (
+                None
+                if refined_shape is None
+                else create_fp8_quant_key(
+                    static=True, group_shape=GroupShape(*refined_shape)
+                )
             )
-        )
-        can_refine = refined_key is not None and any(
-            k_cls._supports_quant_scheme(
-                refined_key, k_cls.executed_activation_key(refined_key, activation_key)
+            can_refine = refined_key is not None and any(
+                k_cls._supports_quant_scheme(
+                    refined_key,
+                    k_cls.executed_activation_key(refined_key, activation_key),
+                )
+                for k_cls in kernel_classes
             )
-            for k_cls in kernel_classes
-        )
         if not can_refine and pad_tp_shard_to_weight_blocks(config, weight_block_size):
             logger.info_once(
                 "FP8 %s TP loading uses complete checkpoint blocks: "

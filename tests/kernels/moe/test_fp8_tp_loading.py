@@ -169,6 +169,15 @@ def test_fp8_tp_default_keeps_refined_layout(monkeypatch, backend, tp_size, bloc
     assert layer.quant_method.moe_block_shape == [block, block]
 
 
+def test_fp8_tp_default_pads_when_refine_impossible(monkeypatch):
+    """640 / TP8 = 80 rows: no block of at least 32 divides the shard."""
+    layer = _make_fp8_tp_experts(monkeypatch, 8, 0, "auto")
+    assert layer.moe_config.tp_shard_with_padding
+    assert layer.moe_config.intermediate_size_per_partition == 128
+    assert layer.quant_method.moe_block_shape == [128, 128]
+    assert layer.quant_method.weight_scale_refine is None
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
