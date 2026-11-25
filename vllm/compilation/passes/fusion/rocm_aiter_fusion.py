@@ -765,7 +765,7 @@ class AiterRMSNormGatedMxfp4GemmPattern(AiterRMSNormQuantPattern):
         ) -> torch.Tensor:
             normed = self.rmsnorm_gated_matcher(x, z, norm_weight)
             merged = normed.reshape(-1, hidden_dim)
-            return torch.ops.vllm.gemm_with_dynamic_quant(
+            return torch.ops.vllm.rocm_aiter_mxfp4_gemm_dynamic_quant(
                 merged, weight, weight_scale, False, out_dtype
             )
 

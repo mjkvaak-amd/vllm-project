@@ -1800,7 +1800,7 @@ def _rocm_aiter_fused_rms_gated_mxfp4_gemm_impl(
         group_size=norm_weight.numel(),
         transpose_scale=True,
     )
-    return torch.ops.vllm.gemm_with_dynamic_quant(
+    return torch.ops.vllm.rocm_aiter_mxfp4_gemm_dynamic_quant(
         x_q,
         weight,
         weight_scale,
